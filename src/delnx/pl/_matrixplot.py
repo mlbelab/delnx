@@ -1,6 +1,6 @@
 import itertools
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import marsilea as ma
@@ -17,14 +17,7 @@ from ._palettes import default_palette
 class MatrixPlot(BasePlot):
     """
     MatrixPlot visualizes group-level mean expression data as a heatmap with support for group annotations and flexible row grouping.
-
-    Parameters
-    ----------
-        group_metadata : pd.DataFrame
-            Metadata for each group, used for annotations.
     """
-
-    group_metadata: pd.DataFrame = field(init=False)
 
     def _build_data(self) -> pd.DataFrame:
         """
@@ -72,12 +65,16 @@ class MatrixPlot(BasePlot):
         self.group_metadata = group_meta.loc[list(self.mean_df.index)]
 
         if self.group_metadata.isnull().any().any():
-            missing = self.group_metadata[self.group_metadata.isnull().any(axis=1)].index.tolist()
+            missing = self.group_metadata[
+                self.group_metadata.isnull().any(axis=1)
+            ].index.tolist()
             raise ValueError(f"Missing group metadata for: {missing}")
 
         return self.mean_df
 
-    def _resolve_row_grouping(self, index_source: Any | None = None) -> tuple[pd.Categorical | None, list[str] | None]:
+    def _resolve_row_grouping(
+        self, index_source: Any | None = None
+    ) -> tuple[pd.Categorical | None, list[str] | None]:
         """
         Determines row grouping for the heatmap.
 
@@ -96,7 +93,9 @@ class MatrixPlot(BasePlot):
 
         # Auto: treat each row as its own group
         if self.row_grouping == "auto":
-            group = pd.Categorical(index_source, categories=list(index_source), ordered=True)
+            group = pd.Categorical(
+                index_source, categories=list(index_source), ordered=True
+            )
             return group, list(index_source)
 
         # No grouping
@@ -106,7 +105,9 @@ class MatrixPlot(BasePlot):
         # Single column from group_metadata
         elif isinstance(self.row_grouping, str):
             values = self.group_metadata.loc[index_source, self.row_grouping]
-            categories = values.drop_duplicates().tolist()  # preserve order of appearance
+            categories = (
+                values.drop_duplicates().tolist()
+            )  # preserve order of appearance
             group = pd.Categorical(values, categories=categories, ordered=True)
             return group, categories
 
@@ -123,7 +124,9 @@ class MatrixPlot(BasePlot):
             if isinstance(self.row_grouping, pd.Series):
                 values = self.row_grouping.loc[index_source]
             else:
-                values = pd.Series(self.row_grouping, index=self.mean_df.index).loc[index_source]
+                values = pd.Series(self.row_grouping, index=self.mean_df.index).loc[
+                    index_source
+                ]
             categories = values.drop_duplicates().tolist()
             group = pd.Categorical(values, categories=categories, ordered=True)
             return group, categories
@@ -181,7 +184,9 @@ class MatrixPlot(BasePlot):
         data = self._build_data()
 
         # Resolve row grouping
-        self.row_group, self.order = self._resolve_row_grouping(self.mean_df.index.astype(str))
+        self.row_group, self.order = self._resolve_row_grouping(
+            self.mean_df.index.astype(str)
+        )
 
         # Check if dendrogram is specified
         # If yes, we have to precompute the dendrogram
@@ -204,7 +209,7 @@ class MatrixPlot(BasePlot):
                     data = self._build_data()
 
         # Scale the data if scaling is enabled
-        data = self._scale_data(data)
+        data = self._scale_data(data, self.scaling_keys)
 
         m = ma.Heatmap(
             data,

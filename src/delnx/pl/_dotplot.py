@@ -19,6 +19,8 @@ class DotPlot(MatrixPlot):
     Inherits from MatrixPlot and uses marsilea's SizedHeatmap for visualization.
     """
 
+    scale_dots: float = 1.0
+
     def _build_size(self) -> pd.DataFrame:
         """
         Computes group-level detection rate (fraction of cells with non-zero expression).
@@ -98,12 +100,12 @@ class DotPlot(MatrixPlot):
                     data = self._build_data()
 
         # Scale the data if scaling is enabled
-        data = self._scale_data(data)
+        data = self._scale_data(data, self.scaling_keys)
 
         m = ma.SizedHeatmap(
             size=size,
             color=data,
-            sizes=(1, self.scale * 100),
+            sizes=(1, self.scale_dots * 100),
             width=self.width,
             height=self.height,
             cmap=self.cmap,

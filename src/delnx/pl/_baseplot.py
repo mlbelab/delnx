@@ -5,7 +5,6 @@ import anndata as ad
 import marsilea as ma
 import marsilea.plotter as mp
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
 from ._palettes import default_palette
@@ -24,51 +23,51 @@ class BasePlot:
     Parameters
     ----------
     adata : ad.AnnData
-        Annotated data matrix (AnnData object) containing observations and variables.
+        The AnnData object containing the data to be plotted.
     markers : list[str]
-        List of marker gene names (variables) to include in the plot.
-    groupby_keys : str or list[str]
-        Key(s) in `adata.obs` used to group samples (e.g., cell types, clusters).
-        If a string is provided, it is converted to a list internally.
-    layer : str or None, optional
-        If specified, use this layer from `adata` instead of the default `.X` matrix
-    scale: bool, default=True
-        Whether to scale gene expression values before plotting.
-    row_grouping : str, list[str], pd.Series, pd.Categorical, or None, default="auto"
-        How to group rows in the heatmap. Can be:
-        - "auto": Use the group labels defined by `groupby_keys`.
-        - str: Name of a column in `adata.obs` to use for grouping.
-        - list[str]: List of column names in `adata.obs` to combine for grouping.
-        - pd.Series or pd.Categorical: Custom grouping vector.
-        - None: No row grouping.
-    cmap : str, default="viridis"
-        Colormap to use for the heatmap.
-    height : float, default=3.5
-        Height of the plot in inches.
-    width : float, default=3
-        Width of the plot in inches.
-    scale_render : float, default=1.0
-        Scale factor for the plot size.
-    show_column_names : bool, default=True
-        Whether to display column (gene) names on the plot.
-    show_row_names : bool, default=True
-        Whether to display row (group) names on the plot.
-    show_legends : bool, default=True
-        Whether to display legends for groupings and colorbars.
-    groupbar_size : float, default=0.1
-        Size of the group color bar relative to the plot.
-    groupbar_pad : float, default=0.05
-        Padding between the group color bar and the heatmap.
-    chunk_rotation : int, default=0
-        Rotation angle (in degrees) for chunk (group) labels.
-    chunk_align : str, default="center"
-        Alignment for chunk (group) labels.
-    chunk_pad : float, default=0.1
-        Padding for chunk (group) labels.
-    chunk_fontsize : int, default=10
-        Font size for chunk (group) labels.
-    dendrograms : list[str] or None, default=None
-        List of dendrogram positions to add to the plot (e.g., ["top", "left"]).
+        List of feature names (e.g., genes) to be plotted. Can also be a dict mapping group names to lists of features.
+    groupby_keys : str | list[str]
+        Key(s) in `adata.obs` used for grouping data. If multiple keys are provided, they will be combined into a single group label.
+    layer : str | None
+        Layer in `adata.layers` to use for the data matrix. If None, uses the default `.X` matrix.
+    scaling_keys : list[str] | None
+        Keys in `adata.obs` for group-wise scaling of the data. If None, no scaling is applied. If an empty list, global scaling is applied.
+    row_grouping : str | list[str] | pd.Series | pd.Categorical | None
+        Defines how to group rows in the heatmap. Can be a column name, list of names, or a Series/Categorical. If "auto", uses the group labels.
+    column_grouping : bool
+        Whether to group columns based on the markers. If True, markers will be grouped by their keys if provided as a dict.
+    cmap : str
+        Colormap to use for the heatmap. Default is "viridis".
+    height : float
+        Height of the heatmap in inches.
+    width : float
+        Width of the heatmap in inches.
+    scale_render : float
+        Scaling factor for rendering the plot. Default is 1.0.
+    show_column_names : bool
+        Whether to display column names (markers) in the heatmap.
+    show_row_names : bool
+        Whether to display row names (group labels) in the heatmap.
+    show_legends : bool
+        Whether to show legends for annotations and colorbars.
+    groupbar_size : float
+        Size of the group colorbars in the heatmap.
+    groupbar_pad : float
+        Padding around the group colorbars.
+    chunk_rotation : int
+        Rotation angle for chunk labels in the heatmap.
+    chunk_align : str
+        Alignment of chunk labels in the heatmap. Options are "left", "center", or "right".
+    chunk_pad : float
+        Padding around chunk labels in the heatmap.
+    chunk_fontsize : int
+        Font size for chunk labels in the heatmap.
+    dendrograms : list[str] | None
+        Positions for dendrograms in the heatmap. Can include "left", "right", "top", or "bottom". If None, no dendrograms are added.
+    group_names : str | list[str] | None
+        Names for the groups used in annotations. If None, uses `groupby_keys` as default.
+    min_group_size : int
+        Minimum number of cells required in a group to be included in the plot. Groups with fewer cells will be filtered out.
     """
 
     adata: ad.AnnData
@@ -80,7 +79,7 @@ class BasePlot:
     layer: str | None = None
 
     # Whether to scale the data before plotting
-    scale: bool = True
+    scaling_keys: list[str] | None = None
 
     # Row grouping options
     row_grouping: str | list[str] | pd.Series | pd.Categorical | None = "auto"
@@ -114,7 +113,13 @@ class BasePlot:
 
     # Group names for annotations
     group_names: str | list[str] | None = None
+
+    # Internal attributes initialized in __post_init__
     group_labels: pd.Categorical = field(init=False)
+    group_metadata: pd.DataFrame = field(init=False)
+
+    # Keep groups with more than this many cells
+    min_group_size: int = 10
 
     def __post_init__(self):
         """Initialize group labels and add them to adata.obs as '_group'."""
@@ -149,8 +154,19 @@ class BasePlot:
         ordered_combinations = ["_".join(tup) for tup in itertools.product(*category_levels)]
 
         # Create ordered categorical
-        self.group_labels = pd.Categorical(group_labels, categories=ordered_combinations, ordered=True)
+        self.group_labels = pd.Categorical(
+            group_labels, categories=[x for x in ordered_combinations if x in group_labels.unique()], ordered=True
+        )
         self.adata.obs["_group"] = self.group_labels
+
+        # Filter groups based on minimum size
+        group_counts = self.adata.obs["_group"].value_counts()
+        valid_groups = group_counts[group_counts > self.min_group_size].index
+
+        self.adata = self.adata[self.adata.obs["_group"].isin(valid_groups)].copy()
+        self.adata.obs["_group"] = self.adata.obs["_group"].cat.remove_unused_categories()
+
+        self.group_metadata = self.adata.obs.copy()
 
     def _resolve_row_grouping(self, index_source=None) -> tuple[pd.Categorical | None, pd.Index | None]:
         """
@@ -196,7 +212,7 @@ class BasePlot:
         else:
             raise ValueError("Invalid value for row_grouping")
 
-    def _build_data(self) -> np.ndarray:
+    def _build_data(self) -> pd.DataFrame:
         """Extracts the data matrix for the selected markers from .X or a specified layer."""
         # Flatten markers if given as a dict
         if isinstance(self.markers, dict):
@@ -216,7 +232,7 @@ class BasePlot:
         if hasattr(mat, "toarray"):
             mat = mat.toarray()
 
-        return mat
+        return pd.DataFrame(mat, index=list(self.adata.obs.index), columns=flat_markers)
 
     def _add_row_labels(self, m: ma.Heatmap):
         """
@@ -355,26 +371,52 @@ class BasePlot:
             m.add_legends()
         return m
 
-    def _scale_data(self, data: np.ndarray) -> np.ndarray:
+    def _scale_data(self, data: pd.DataFrame, scaling_keys: list = None) -> pd.DataFrame:
         """
-        Scale the data matrix if scaling is enabled.
+        Conditionally apply min-max scaling to the data.
 
         Parameters
         ----------
-        data : np.ndarray
-            The data matrix to scale.
+        data : pd.DataFrame
+            Data matrix (rows indexed by _group, columns are features like genes).
+        scaling_keys : list of str, optional
+            - If None: no scaling is applied.
+            - If empty list ([]): global scaling is applied.
+            - If list of metadata keys: scaling is done per group defined by those keys.
 
         Returns
         -------
-        np.ndarray
-            The scaled data matrix.
+        pd.DataFrame
+            Scaled data with same shape and index/columns as input.
         """
-        if self.scale:
-            # Scale the data to [0, 1] range
-            data_min = np.min(data, axis=0)
-            data_max = np.max(data, axis=0)
-            data = (data - data_min) / (data_max - data_min)
-        return data
+        # Case 1: No scaling requested
+        if scaling_keys is None:
+            return data.copy()
+
+        # Ensure the metadata and data are aligned
+        if not set(scaling_keys).issubset(self.group_metadata.columns):
+            raise ValueError(f"Scaling keys {scaling_keys} not found in group metadata columns.")
+
+        df_metadata = self.group_metadata.copy()
+
+        # Case 2: Global scaling
+        if len(scaling_keys) == 0:
+            data_min = data.min(axis=0)
+            data_max = data.max(axis=0)
+            return (data - data_min) / (data_max - data_min).replace(0, 1e-8)
+
+        # Case 3: Group-wise scaling
+        scaled_data = pd.DataFrame(index=data.index, columns=data.columns, dtype=float)
+        groupby_obj = df_metadata.groupby(scaling_keys)
+
+        for _, idx in groupby_obj.groups.items():
+            group_data = data.loc[idx]
+            data_min = group_data.min(axis=0)
+            data_max = group_data.max(axis=0)
+            scaled_group = (group_data - data_min) / (data_max - data_min).replace(0, 1e-8)
+            scaled_data.loc[idx] = scaled_group
+
+        return scaled_data
 
     def _build_plot(self):
         """Build the base heatmap plot."""
@@ -382,7 +424,7 @@ class BasePlot:
         data = self._build_data()
 
         # Scale the data if scaling is enabled
-        data = self._scale_data(data)
+        data = self._scale_data(data, self.scaling_keys)
 
         # Create heatmap
         m = ma.Heatmap(
@@ -394,8 +436,6 @@ class BasePlot:
         )
         # Extract grouping information
         self.row_group, self.order = self._resolve_row_grouping()
-        if self.row_group is not None:
-            m.group_rows(self.row_group, order=self.order)
         # Add extras to the heatmap
         m = self._add_extras(m)
         return m
