@@ -29,9 +29,27 @@ Differential Expression
     de
     rank_de
     grouped
-    build_design
+
+
+Effect Sizes
+~~~~~~~~~~~~
+
+.. currentmodule:: delnx.tl
+.. autosummary::
+    :toctree: genapi
+
     log2fc
     auroc
+
+
+Utilities
+~~~~~~~~~
+
+.. currentmodule:: delnx.tl
+.. autosummary::
+    :toctree: genapi
+
+    build_design
     single_enrichment_analysis
 
 

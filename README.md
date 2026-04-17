@@ -17,7 +17,7 @@
 
 # 🌳 delnx
 
-**delnx** (`"de-lo-nix"  | /dɪˈlɒnɪks/`) is a python package for differential expression analysis of (single-cell) genomics data. It enables scalable analyses of atlas-level datasets through GPU-accelerated regression models and statistical tests implemented in [JAX](https://docs.jax.dev/en/latest/). It also provides a consistent interface to perform DE analysis with other methods, such as [statsmodels](https://www.statsmodels.org/stable/index.html) and [PyDESeq2](https://pydeseq2.readthedocs.io/en/stable/).
+**delnx** (`"de-lo-nix"  | /dɪˈlɒnɪks/`) is a python package for differential expression analysis of (single-cell) genomics data. It enables scalable analyses of atlas-level datasets through GPU-accelerated regression models and statistical tests implemented in [JAX](https://docs.jax.dev/en/latest/).
 
 ## 🚀 Installation
 
@@ -36,51 +36,64 @@ pip install git+https://github.com/joschif/delnx.git@main
 
 ## ⚡ Quickstart
 
+### Negative binomial DE (count data)
+
 ```python
 import delnx as dx
 
-# Compute size factors
-adata = dx.pp.size_factors(adata, method="ratio")
+# Fit negative binomial GLMs with quasi-likelihood dispersion shrinkage
+fit = dx.tl.nb_fit(adata, condition_key="treatment", reference="control")
 
-# Estimate dispersion parameters
-adata = dx.pp.dispersion(
-    adata,
-    size_factor_key="size_factors",
-    covariate_keys=["condition"]
-)
+# Test for differential expression
+results = dx.tl.nb_test(adata, fit, contrast="treatment[T.drugA]")
+```
 
-# Run differential expression analysis
+### General-purpose DE (log-normalized / binary data)
+
+```python
+# Logistic regression with likelihood ratio test
 results = dx.tl.de(
     adata,
-    condition_key="condition",
-    group_key="cell_type",
-    mode="all_vs_ref",
+    condition_key="treatment",
     reference="control",
-    method="negbinom",
-    size_factor_key="size_factors",
-    dispersion_key="dispersions",
+    contrast="treatment[T.drugA]",
+)
+
+# Formula-based design with covariates
+results = dx.tl.de(
+    adata,
+    formula="~ treatment + batch",
+    contrast="treatment[T.drugA]",
+    method="anova",
 )
 ```
 
+### Per-group DE with grouped wrapper
+
+```python
+results = dx.tl.grouped(
+    dx.tl.de, adata,
+    group_key="cell_type",
+    condition_key="treatment",
+    reference="control",
+    contrast="treatment[T.drugA]",
+)
+```
+
+### Fast rank-based markers
+
+```python
+results = dx.tl.rank_de(adata, condition_key="cell_type")
+```
+
 ## 💎 Features
+- **Negative binomial GLMs**: GPU-accelerated glmGamPoi-style fitting with quasi-likelihood dispersion shrinkage for count data.
+- **General-purpose DE**: Logistic regression, ANOVA, and binomial GLM for log-normalized, scaled, or binary data.
+- **Formula interface**: R-style formulas (`~ treatment + batch`) parsed by patsy, with treatment coding and reference levels.
+- **Rank-based markers**: Fast AUROC-based one-vs-all marker detection with Numba-optimized ranking.
 - **Pseudobulking**: Perform DE on large multi-sample datasets by using pseudobulk aggregation.
-- **Size factor estimation**: Compute size factors for normalization and DE analysis.
-- **Dispersion estimation**: Estimate dispersion parameters for negative binomial models.
-- **Differential expression analysis**: Consistent interface to perform DE analysis using various methods, including:
-  - **Negative binomial regression** with dispersion estimates.
-  - **Logistic regression** with a likelihood ratio test.
-  - **ANOVA** tests based on linear models.
-  - **DESeq2** through [PyDESeq2](https://pydeseq2.readthedocs.io/en/stable/), a widely used method for DE analysis of RNA-seq data.
-- **GPU acceleration**: Most methods are implemented in JAX, enabling GPU acceleration for scalable DE-analysis on large datasets.
-
-
-## ⚙️ Backends
-**delnx** implements DE tests using regression models and statistical tests from various backends:
-
-- [JAX](https://docs.jax.dev/en/latest/)
-- [statsmodels](https://www.statsmodels.org/stable/index.html)
-- [cuML](https://github.com/rapidsai/cuml)
-- [PyDESeq2](https://pydeseq2.readthedocs.io/en/stable/)
+- **Effect sizes**: Log2 fold change and AUROC computation for pairwise condition comparisons.
+- **GPU acceleration**: Core methods are implemented in JAX, enabling GPU acceleration for scalable DE analysis on large datasets.
 
 
 ## 📖 Documentation
