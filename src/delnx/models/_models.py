@@ -201,11 +201,10 @@ class Regression:
             # Compute likelihood ratio statistic
             lr_stat = 2 * (ll_full - ll_reduced)
             lr_stat = jnp.maximum(lr_stat, 0.0)
-            # Compute correction for small sample sizes
+            # Compute correction for small sample sizes (where appropriate)
             n_samples = X.shape[0]
             n_params = X.shape[1]
-            correction = 1 + n_params / (n_samples - n_params)
-            correction = jnp.maximum(1.0, correction)
+            correction = 1 + n_params / jnp.maximum(1.0, n_samples - n_params)
             corrected_lr_stat = lr_stat / correction
             # Compute p-value for the likelihood ratio statistic
             lr_pval = jsp.stats.chi2.sf(corrected_lr_stat, df=1)
