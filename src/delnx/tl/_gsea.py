@@ -10,7 +10,7 @@ MIN_GENESET_SIZE = 5
 MAX_GENESET_SIZE = 500
 
 
-def single_enrichment_analysis(
+def gsea(
     genes: Sequence[str],
     background: Sequence[str] | None = None,
     gene_sets: dict[str, list[str]] | None = None,

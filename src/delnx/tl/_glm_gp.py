@@ -679,7 +679,3 @@ def nb_de(
     )
 
 
-# Deprecated aliases
-GLMGPResult = NBFitResult
-glm_gp = nb_fit
-glm_gp_test = nb_test

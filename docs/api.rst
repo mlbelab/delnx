@@ -11,7 +11,6 @@ Preprocessing
 
     pseudobulk
     size_factors
-    dispersion
 
 
 Differential Expression
@@ -29,10 +28,28 @@ Differential Expression
     de
     rank_de
     grouped
-    build_design
+
+
+Effect Sizes
+~~~~~~~~~~~~
+
+.. currentmodule:: delnx.tl
+.. autosummary::
+    :toctree: genapi
+
     log2fc
     auroc
-    single_enrichment_analysis
+
+
+Utilities
+~~~~~~~~~
+
+.. currentmodule:: delnx.tl
+.. autosummary::
+    :toctree: genapi
+
+    build_design
+    gsea
 
 
 Models
@@ -46,7 +63,6 @@ Models
     LinearRegression
     LogisticRegression
     NegativeBinomialRegression
-    DispersionEstimator
 
 
 Plotting
@@ -58,8 +74,6 @@ Plotting
     :toctree: genapi
 
     dotplot
-    gsea_dotplot
-    gsea_heatmap
     heatmap
     matrixplot
     violinplot
