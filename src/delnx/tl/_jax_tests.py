@@ -50,7 +50,7 @@ def _run_lr_test(
     pvals = stats.chi2.sf(lr_stats, 1)
     coefs = coefs_full[:, -1]
 
-    return coefs, pvals
+    return coefs, np.asarray(lr_stats), pvals
 
 
 # =============================================================================
@@ -179,7 +179,7 @@ def _run_anova_test(
         p_resid_cdf = stats.f.cdf(np.asarray(f_stat), int(df_null), int(df_full))
         pvals = 1 - np.abs(0.5 - p_resid_cdf) * 2
 
-    return coefs, pvals
+    return coefs, np.asarray(f_stat), pvals
 
 
 def _run_batched_de(
@@ -291,15 +291,17 @@ def _run_batched_de(
     results = {
         "feature": [],
         "coef": [],
+        "stat": [],
         "pval": [],
     }
     for i in tqdm.tqdm(range(0, n_features, batch_size), disable=not verbose):
         batch = slice(i, min(i + batch_size, n_features))
         X_batch = jnp.asarray(_to_dense(X[:, batch]), dtype=jnp.float64)
-        coefs, pvals = test_fn(X_batch)
+        coefs, test_stats, pvals = test_fn(X_batch)
 
         results["feature"].extend(feature_names[batch].tolist())
         results["coef"].extend(coefs.tolist())
+        results["stat"].extend(np.asarray(test_stats).tolist())
         results["pval"].extend(pvals.tolist())
 
     return pd.DataFrame(results)

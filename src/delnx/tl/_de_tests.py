@@ -66,7 +66,7 @@ def _run_lr_test(
     df_diff = full_model.df_model - reduced_model.df_model
     pval = stats.chi2.sf(lr_stat, df_diff)
 
-    return full_model.params["X"], pval
+    return full_model.params["X"], lr_stat, pval
 
 
 
@@ -124,14 +124,18 @@ def _run_anova(
         a1 = anova_lm(model)
 
     p_anova = a1.loc[condition_key, "PR(>F)"]
+    f_stat_anova = a1.loc[condition_key, "F"]
+    f_stat_resid = a0.loc["Residual", "mean_sq"] / a1.loc["Residual", "mean_sq"]
     p_resid_cdf = stats.f.cdf(
-        a0.loc["Residual", "mean_sq"] / a1.loc["Residual", "mean_sq"],
+        f_stat_resid,
         a0.loc["Residual", "df"],
         a1.loc["Residual", "df"],
     )
     p_resid = 1 - np.abs(0.5 - p_resid_cdf) * 2
 
-    return model.params[condition_key], p_anova if method == "anova" else p_resid
+    if method == "anova":
+        return model.params[condition_key], f_stat_anova, p_anova
+    return model.params[condition_key], f_stat_resid, p_resid
 
 
 def _run_binomial(
@@ -186,7 +190,9 @@ def _run_binomial(
         # Fit model with binomial family and logit link
         glm = sm.GLM.from_formula(formula=formula, data=model_data, family=sm.families.Binomial()).fit(disp=False)
 
-    return glm.params[condition_key], glm.pvalues[condition_key]
+    # LR test stat: deviance difference from null
+    lr_stat = glm.null_deviance - glm.deviance
+    return glm.params[condition_key], lr_stat, glm.pvalues[condition_key]
 
 
 # Dictionary mapping backends to available test methods
@@ -292,32 +298,16 @@ def _run_de(
     if method == "negbinom":
         test_func = partial(test_func, size_factors=size_factors)
 
-    def _process_feature(i: int) -> tuple[str, float, float] | tuple[str, None, None]:
-        """Process a single feature and return test results or None if test failed.
-
-        This inner function handles testing for an individual feature, including
-        error handling to ensure one failing test doesn't stop the entire process.
-
-        Parameters
-        ----------
-        i : int
-            Index of the feature in the expression matrix X.
-
-        Returns
-        -------
-        tuple[str, float, float] | tuple[str, None, None]
-            If successful: (feature_name, coefficient, p-value)
-            If failed: (feature_name, None, None)
-        """
+    def _process_feature(i: int):
         try:
             x = _to_dense(X[:, i]).flatten()
-            coef, pval = test_func(
+            coef, stat, pval = test_func(
                 x, model_data, condition_key=condition_key, covariate_keys=covariate_keys, verbose=False
             )
-            return feature_names[i], coef, pval
+            return feature_names[i], coef, stat, pval
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Error testing feature {feature_names[i]}: {str(e)}", verbose=verbose)
-            return feature_names[i], None, None
+            return feature_names[i], None, None, None
 
     # Run tests in parallel with progress bar
     n_features = X.shape[1]
@@ -335,14 +325,16 @@ def _run_de(
     results = {
         "feature": [],
         "coef": [],
+        "stat": [],
         "pval": [],
     }
     errors = {}
 
-    for feat, coef, pval in feature_results:
+    for feat, coef, stat, pval in feature_results:
         if coef is not None and pval is not None:
             results["feature"].append(feat)
             results["coef"].append(coef)
+            results["stat"].append(stat)
             results["pval"].append(pval)
         else:
             errors[feat] = "Test failed"

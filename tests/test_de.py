@@ -18,7 +18,7 @@ def test_de_methods_pb_lognorm(adata_pb_lognorm, method):
 
     assert isinstance(results, pd.DataFrame)
     assert len(results) > 50
-    assert list(results.columns) == ["feature", "coef", "pval", "padj"]
+    assert list(results.columns) == ["feature", "log2fc", "coef", "stat", "pval", "padj"]
 
 
 def test_de_default_contrast(adata_pb_lognorm):
@@ -31,7 +31,7 @@ def test_de_default_contrast(adata_pb_lognorm):
 
     assert isinstance(results, pd.DataFrame)
     assert len(results) > 50
-    assert list(results.columns) == ["feature", "coef", "pval", "padj"]
+    assert list(results.columns) == ["feature", "log2fc", "coef", "stat", "pval", "padj"]
 
 
 def test_de_with_covariates(adata_pb_lognorm):
@@ -71,7 +71,7 @@ def test_de_formula_basic(adata_pb_lognorm):
 
     assert isinstance(results, pd.DataFrame)
     assert len(results) > 0
-    assert list(results.columns) == ["feature", "coef", "pval", "padj"]
+    assert list(results.columns) == ["feature", "log2fc", "coef", "stat", "pval", "padj"]
 
 
 def test_de_formula_with_covariates(adata_pb_lognorm):
@@ -84,7 +84,7 @@ def test_de_formula_with_covariates(adata_pb_lognorm):
 
     assert isinstance(results, pd.DataFrame)
     assert len(results) > 0
-    assert list(results.columns) == ["feature", "coef", "pval", "padj"]
+    assert list(results.columns) == ["feature", "log2fc", "coef", "stat", "pval", "padj"]
 
 
 def test_de_formula_continuous(adata_pb_lognorm):
@@ -99,7 +99,7 @@ def test_de_formula_continuous(adata_pb_lognorm):
 
     assert isinstance(results, pd.DataFrame)
     assert len(results) > 0
-    assert list(results.columns) == ["feature", "coef", "pval", "padj"]
+    assert list(results.columns) == ["feature", "log2fc", "coef", "stat", "pval", "padj"]
 
 
 @pytest.mark.parametrize(
@@ -123,7 +123,7 @@ def test_de_methods_sc(adata_small, method, layer):
 
     assert isinstance(results, pd.DataFrame)
     assert len(results) > 0
-    assert list(results.columns) == ["feature", "coef", "pval", "padj"]
+    assert list(results.columns) == ["feature", "log2fc", "coef", "stat", "pval", "padj"]
 
 
 def test_de_binomial_binary(adata_small):
@@ -138,7 +138,7 @@ def test_de_binomial_binary(adata_small):
 
     assert isinstance(results, pd.DataFrame)
     assert len(results) > 80
-    assert list(results.columns) == ["feature", "coef", "pval", "padj"]
+    assert list(results.columns) == ["feature", "log2fc", "coef", "stat", "pval", "padj"]
 
 
 def test_de_errors(adata_pb_lognorm):

@@ -29,8 +29,9 @@ Differential Expression
     de
     rank_de
     grouped
+    build_design
     log2fc
-    de_enrichment_analysis
+    auroc
     single_enrichment_analysis
 
 

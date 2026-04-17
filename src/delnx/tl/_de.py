@@ -96,7 +96,9 @@ def de(
         Results with columns:
 
         - ``feature``: Gene/feature names
-        - ``coef``: Model coefficient
+        - ``log2fc``: Log2 fold change (coefficient / log(2), clipped to [-10, 10])
+        - ``coef``: Model coefficient (log scale)
+        - ``stat``: Test statistic (LR chi-squared or F-statistic)
         - ``pval``: Raw p-value
         - ``padj``: Adjusted p-value
 
@@ -218,6 +220,9 @@ def de(
             "Check input data or set verbose=True for details."
         )
 
+    # Compute log2fc from coefficient (coef is on log scale for LR/binomial)
+    results["log2fc"] = np.clip(results["coef"] / np.log(2), -10.0, 10.0)
+
     # Clip p-values
     results["pval"] = np.clip(results["pval"], 1e-50, 1)
 
@@ -230,4 +235,4 @@ def de(
         )[1]
 
     results = results.sort_values(by=["padj", "coef"]).reset_index(drop=True)
-    return results[["feature", "coef", "pval", "padj"]].copy()
+    return results[["feature", "log2fc", "coef", "stat", "pval", "padj"]].copy()
