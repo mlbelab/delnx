@@ -157,11 +157,7 @@ def _check_method_and_data_type(
     if method not in COMPATIBLE_DATA_TYPES:
         raise ValueError(f"Method '{method}' is not recognized or supported.")
 
-    if method == "deseq2" and data_type not in COMPATIBLE_DATA_TYPES["deseq2"]:
-        raise ValueError(f"DESeq2 requires count data. Current data type is {data_type}.")
-    elif method == "negbinom" and data_type not in COMPATIBLE_DATA_TYPES["negbinom"]:
-        raise ValueError(f"Negative binomial models require count data. Current data type is {data_type}.")
-    elif method == "binomial" and data_type not in COMPATIBLE_DATA_TYPES["binomial"]:
+    if method == "binomial" and data_type not in COMPATIBLE_DATA_TYPES["binomial"]:
         raise ValueError(f"Binomial models require binary data. Current data type is {data_type}.")
     elif method == "lr" and data_type not in COMPATIBLE_DATA_TYPES["lr"]:
         logger.warning(

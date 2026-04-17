@@ -22,8 +22,16 @@ Differential Expression
 .. autosummary::
     :toctree: genapi
 
+    nb_fit
+    nb_test
+    nb_de
+    NBFitResult
     de
+    rank_de
+    grouped
+    log2fc
     de_enrichment_analysis
+    single_enrichment_analysis
 
 
 Models

@@ -1,4 +1,4 @@
-"""glmGamPoi-style differential expression analysis.
+"""Negative binomial differential expression analysis.
 
 This module provides the main interface for GPU-accelerated negative binomial
 differential expression analysis using the glmGamPoi approach. Core solvers
@@ -50,16 +50,16 @@ from delnx.pp._size_factors import size_factors as compute_size_factors
 
 
 @dataclass
-class GLMGPResult:
-    """Result container for glm_gp fit.
+class NBFitResult:
+    """Result container for nb_fit.
 
     Attributes
     ----------
-    Beta : np.ndarray
+    beta : np.ndarray
         Fitted coefficients, shape (n_genes, n_coefficients).
     overdispersions : np.ndarray
         MLE dispersion estimates per gene, shape (n_genes,).
-    Mu : np.ndarray
+    mu : np.ndarray
         Fitted mean values, shape (n_samples, n_genes).
     size_factors : np.ndarray
         Size factors per sample, shape (n_samples,).
@@ -67,11 +67,12 @@ class GLMGPResult:
         Deviance per gene, shape (n_genes,).
     design_matrix : np.ndarray
         Design matrix used, shape (n_samples, n_coefficients).
+    design_column_names : list[str]
+        Column names for the design matrix (e.g., ["intercept", "condB"]).
     feature_names : pd.Index
         Feature/gene names.
-    counts : np.ndarray | None
-        Original count matrix, shape (n_samples, n_genes). Stored for
-        reduced-model refitting in test_de.
+    layer : str | None
+        Layer used for count data.
     condition_key : str | None
         Condition key used for design.
     ql_dispersions : np.ndarray | None
@@ -84,14 +85,15 @@ class GLMGPResult:
         Convergence status per gene.
     """
 
-    Beta: np.ndarray
+    beta: np.ndarray
     overdispersions: np.ndarray
-    Mu: np.ndarray
+    mu: np.ndarray
     size_factors: np.ndarray
     deviances: np.ndarray
     design_matrix: np.ndarray
+    design_column_names: list[str]
     feature_names: pd.Index
-    counts: np.ndarray | None = None
+    layer: str | None = None
     condition_key: str | None = None
     ql_dispersions: np.ndarray | None = None
     df0_prior: float = 0.0
@@ -104,23 +106,27 @@ class GLMGPResult:
 # =============================================================================
 
 
-def glm_gp(
+def nb_fit(
     adata: AnnData,
     condition_key: str | None = None,
+    formula: str | None = None,
     design: np.ndarray | None = None,
+    design_column_names: list[str] | None = None,
+    reference: str | None = None,
+    covariate_keys: list[str] | None = None,
     size_factors: str | np.ndarray | None = "normed_sum",
     layer: str | None = None,
     overdispersion: bool = True,
-    overdispersion_shrinkage: bool = True,
-    do_cox_reid_adjustment: bool = True,
     batch_size: int = 512,
     maxiter: int = 100,
     verbose: bool = True,
-) -> GLMGPResult:
+    overdispersion_shrinkage: bool = True,
+    do_cox_reid_adjustment: bool = True,
+) -> NBFitResult:
     """Fit Gamma-Poisson (negative binomial) GLMs to count data.
 
     This implements the glmGamPoi approach for fast and accurate differential
-    expression analysis using GPU-accelerated Fisher-scoring with quasi-likelihood
+    expression analysis using GPU-accelerated Newton-Raphson with quasi-likelihood
     dispersion shrinkage.
 
     Parameters
@@ -128,35 +134,51 @@ def glm_gp(
     adata : AnnData
         AnnData object containing count data.
     condition_key : str | None, default=None
-        Column in `adata.obs` for condition labels. Creates a design matrix
-        with intercept + condition indicators.
+        Column in ``adata.obs`` for condition labels. Creates a design matrix
+        with intercept + condition indicators. Mutually exclusive with ``formula``.
+    formula : str | None, default=None
+        R-style formula for the design matrix (e.g., ``"~ treatment + batch"``
+        or ``"~ treatment * batch"``). Parsed by patsy. Mutually exclusive
+        with ``condition_key``.
     design : np.ndarray | None, default=None
-        Custom design matrix. If provided, overrides condition_key.
+        Custom design matrix. If provided, overrides ``condition_key``,
+        ``formula``, ``reference``, and ``covariate_keys``.
         Shape should be (n_samples, n_coefficients).
+    design_column_names : list[str] | None, default=None
+        Column names for a custom ``design`` matrix. Enables string-based
+        ``contrast`` in :func:`nb_test`. If None with custom ``design``,
+        generic names ``coef_0``, ``coef_1``, ... are used.
+    reference : str | None, default=None
+        Reference level for the condition. This level becomes the intercept.
+        If None, the alphabetically first level is used.
+    covariate_keys : list[str] | None, default=None
+        Columns in ``adata.obs`` to include as covariates in the design matrix.
+        Only used with ``condition_key`` (include covariates in ``formula`` directly).
     size_factors : str | np.ndarray | None, default="normed_sum"
         Size factors for normalization. Can be:
-        - "normed_sum": Compute using normalized sum method
-        - "poscounts": DESeq2-style positive counts method
+
+        - ``"normed_sum"``: Compute using normalized sum method
+        - ``"poscounts"``: DESeq2-style positive counts method
         - np.ndarray: Pre-computed size factors
         - None: No size factor normalization (all 1s)
     layer : str | None, default=None
-        Layer in `adata.layers` containing counts. If None, uses `adata.X`.
+        Layer in ``adata.layers`` containing counts. If None, uses ``adata.X``.
     overdispersion : bool, default=True
         Whether to estimate overdispersion. If False, uses Poisson (disp=0).
+    batch_size : int, default=512
+        Number of genes to process in each batch.
+    maxiter : int, default=100
+        Maximum iterations for Newton-Raphson.
+    verbose : bool, default=True
+        Whether to show progress.
     overdispersion_shrinkage : bool, default=True
         Whether to apply quasi-likelihood shrinkage to dispersions.
     do_cox_reid_adjustment : bool, default=True
         Whether to apply Cox-Reid adjustment to dispersion MLE.
-    batch_size : int, default=512
-        Number of genes to process in each batch.
-    maxiter : int, default=100
-        Maximum iterations for Fisher-scoring.
-    verbose : bool, default=True
-        Whether to show progress.
 
     Returns
     -------
-    GLMGPResult
+    NBFitResult
         Fitted model results containing coefficients, dispersions, and
         fitted values.
 
@@ -165,9 +187,26 @@ def glm_gp(
     Basic usage with condition comparison:
 
     >>> import delnx as dx
-    >>> fit = dx.tl.glm_gp(adata, condition_key="treatment")
-    >>> results = dx.tl.test_de(fit, contrast="treatment")
+    >>> fit = dx.tl.nb_fit(adata, condition_key="treatment")
+    >>> results = dx.tl.nb_test(adata, fit, contrast="treatment[T.drugA]")
+
+    With reference level and covariates:
+
+    >>> fit = dx.tl.nb_fit(adata, condition_key="treatment", reference="control",
+    ...                    covariate_keys=["batch", "sex"])
+
+    Formula-based design with interactions:
+
+    >>> fit = dx.tl.nb_fit(adata, formula="~ treatment * batch")
+    >>> results = dx.tl.nb_test(adata, fit, contrast="treatment[T.drugA]:batch[T.batch2]")
+
+    Continuous covariate:
+
+    >>> fit = dx.tl.nb_fit(adata, formula="~ age + sex")
+    >>> results = dx.tl.nb_test(adata, fit, contrast="age")
     """
+    from ._design import build_design
+
     # Get count matrix
     X = _get_layer(adata, layer)
     n_samples, n_genes = X.shape
@@ -185,22 +224,23 @@ def glm_gp(
     sf = np.maximum(sf, 1e-10)
     log_sf = np.log(sf)
 
-    # Build design matrix
+    # Build design matrix (priority: design > formula > condition_key)
     if design is not None:
         design_matrix = np.asarray(design)
-    elif condition_key is not None:
-        # Create design matrix from condition
-        conditions = adata.obs[condition_key].values
-        unique_conditions = np.unique(conditions)
-
-        # Intercept + indicators for each condition except reference
-        design_matrix = np.ones((n_samples, 1))
-        for cond in unique_conditions[1:]:
-            col = (conditions == cond).astype(float)
-            design_matrix = np.column_stack([design_matrix, col])
+        if design_column_names is None:
+            design_column_names = [f"coef_{i}" for i in range(design_matrix.shape[1])]
+    elif formula is not None or condition_key is not None:
+        design_matrix, design_column_names = build_design(
+            adata.obs,
+            formula=formula,
+            condition_key=condition_key,
+            reference=reference,
+            covariate_keys=covariate_keys,
+        )
     else:
         # Intercept only
         design_matrix = np.ones((n_samples, 1))
+        design_column_names = ["Intercept"]
 
     n_coef = design_matrix.shape[1]
 
@@ -225,11 +265,11 @@ def glm_gp(
         logger.info(f"Fitting {n_genes} genes with {n_coef} coefficient(s)", verbose=True)
 
     # Initialize storage
-    Beta = np.zeros((n_genes, n_coef))
+    all_beta = np.zeros((n_genes, n_coef))
     dispersions = np.zeros(n_genes)
     deviances = np.zeros(n_genes)
     converged = np.zeros(n_genes, dtype=bool)
-    Mu = np.zeros((n_samples, n_genes))
+    all_mu = np.zeros((n_samples, n_genes))
 
     sf_jax = jnp.array(sf)
 
@@ -291,7 +331,7 @@ def glm_gp(
                 X_batch, sf_jax, disp_arr, maxiter, 1e-8,
             )
             mu_batch = sf_jax[:, None] * jnp.exp(beta0_arr[None, :])
-            Beta[start:end, 0] = np.asarray(beta0_arr)
+            all_beta[start:end, 0] = np.asarray(beta0_arr)
         else:
             beta_arr, dev_arr, conv_arr = fit_beta_newton_batch(
                 X_batch, design_jax, offset_jax, disp_arr, beta_arr,
@@ -299,13 +339,13 @@ def glm_gp(
             )
             eta_batch = design_jax @ beta_arr.T + offset_jax[:, None]
             mu_batch = jnp.exp(jnp.clip(eta_batch, -50, 50))
-            Beta[start:end] = np.asarray(beta_arr)
+            all_beta[start:end] = np.asarray(beta_arr)
 
         # Store results
         dispersions[start:end] = np.asarray(disp_arr)
         deviances[start:end] = np.asarray(dev_arr)
         converged[start:end] = np.asarray(conv_arr)
-        Mu[:, start:end] = np.asarray(mu_batch)
+        all_mu[:, start:end] = np.asarray(mu_batch)
 
     # Apply quasi-likelihood shrinkage if requested
     ql_dispersions = None
@@ -317,7 +357,7 @@ def glm_gp(
             logger.info("Applying quasi-likelihood shrinkage", verbose=True)
 
         # Compute mean expression
-        mean_expression = np.mean(Mu, axis=0)
+        mean_expression = np.mean(all_mu, axis=0)
 
         # Fit dispersion trend
         dispersion_trend = fit_dispersion_trend(
@@ -326,10 +366,10 @@ def glm_gp(
 
         # Recompute deviances using trend dispersion (vectorized)
         counts_dense_jax = jnp.array(_to_dense(X).astype(np.float64))
-        Mu_jax = jnp.array(Mu)
+        mu_jax = jnp.array(all_mu)
         disp_trend_jax = jnp.array(dispersion_trend)
         deviances = np.asarray(compute_gp_deviance_batch(
-            counts_dense_jax, Mu_jax, disp_trend_jax
+            counts_dense_jax, mu_jax, disp_trend_jax
         ))
 
         # Transform to QL scale
@@ -343,18 +383,16 @@ def glm_gp(
             ql_dispersions, df_residual
         )
 
-    # Store dense count matrix for reduced-model refitting in test_de
-    counts_dense = _to_dense(X)
-
-    return GLMGPResult(
-        Beta=Beta,
+    return NBFitResult(
+        beta=all_beta,
         overdispersions=dispersions,
-        Mu=Mu,
+        mu=all_mu,
         size_factors=sf,
         deviances=deviances,
         design_matrix=design_matrix,
+        design_column_names=design_column_names,
         feature_names=adata.var_names,
-        counts=counts_dense,
+        layer=layer,
         condition_key=condition_key,
         ql_dispersions=ql_dispersions,
         df0_prior=df0_prior,
@@ -368,29 +406,33 @@ def glm_gp(
 # =============================================================================
 
 
-def test_de(
-    fit: GLMGPResult,
-    contrast: str | int | np.ndarray | None = None,
+def nb_test(
+    adata: AnnData,
+    fit: NBFitResult,
+    contrast: str | int | None = None,
     reduced_design: np.ndarray | None = None,
-    pval_adjust_method: str = "fdr_bh",
+    multitest_method: str = "fdr_bh",
     lfc_threshold: float = 0.0,
 ) -> pd.DataFrame:
     """Test for differential expression using quasi-likelihood F-test.
 
     Parameters
     ----------
-    fit : GLMGPResult
-        Fitted model from `glm_gp()`.
-    contrast : str | int | np.ndarray | None, default=None
+    adata : AnnData
+        AnnData object (same one passed to ``nb_fit()``).
+    fit : NBFitResult
+        Fitted model from ``nb_fit()``.
+    contrast : str | int | None, default=None
         Contrast to test. Can be:
-        - str: Name of condition level to test (vs reference)
-        - int: Index of coefficient to test
-        - np.ndarray: Custom contrast vector
-        - None: Test last coefficient
+
+        - str: Design column name to test (e.g., ``"treatmentB"``).
+          Use ``fit.design_column_names`` to see available names.
+        - int: Index of coefficient to test.
+        - None: Test last coefficient.
     reduced_design : np.ndarray | None, default=None
         Reduced design matrix for likelihood ratio test.
         If None, automatically created by dropping the tested coefficient.
-    pval_adjust_method : str, default="fdr_bh"
+    multitest_method : str, default="fdr_bh"
         Method for multiple testing correction.
     lfc_threshold : float, default=0.0
         Threshold for log2 fold change filtering.
@@ -399,26 +441,27 @@ def test_de(
     -------
     pd.DataFrame
         Results with columns:
-        - feature: Gene/feature names
-        - log2fc: Log2 fold change
-        - coef: Model coefficient
-        - stat: F-statistic
-        - pval: Raw p-value
-        - padj: Adjusted p-value
+
+        - ``feature``: Gene/feature names
+        - ``log2fc``: Log2 fold change
+        - ``coef``: Model coefficient
+        - ``stat``: F-statistic
+        - ``pval``: Raw p-value
+        - ``padj``: Adjusted p-value
 
     Examples
     --------
     Test for treatment effect:
 
-    >>> fit = dx.tl.glm_gp(adata, condition_key="treatment")
-    >>> results = dx.tl.test_de(fit)
+    >>> fit = dx.tl.nb_fit(adata, condition_key="treatment")
+    >>> results = dx.tl.nb_test(adata, fit)
 
-    Test specific contrast:
+    Test specific contrast by name:
 
-    >>> results = dx.tl.test_de(fit, contrast=1)  # Test second coefficient
+    >>> results = dx.tl.nb_test(adata, fit, contrast="treatmentB")
     """
-    n_genes = fit.Beta.shape[0]
-    n_coef = fit.Beta.shape[1]
+    n_genes = fit.beta.shape[0]
+    n_coef = fit.beta.shape[1]
     n_samples = fit.design_matrix.shape[0]
 
     # Determine which coefficient to test
@@ -427,17 +470,17 @@ def test_de(
     elif isinstance(contrast, int):
         test_idx = contrast
     elif isinstance(contrast, str):
-        # Find coefficient index from condition name
-        # This assumes condition_key was used
-        if fit.condition_key is None:
-            raise ValueError("Cannot use string contrast without condition_key")
-        test_idx = n_coef - 1  # Default to last
+        if contrast not in fit.design_column_names:
+            raise ValueError(
+                f"Contrast '{contrast}' not found in design columns. "
+                f"Available: {fit.design_column_names}"
+            )
+        test_idx = fit.design_column_names.index(contrast)
     else:
-        # Custom contrast vector - not implemented yet
         raise NotImplementedError("Custom contrast vectors not yet supported")
 
     # Get coefficients for tested term
-    coefs = fit.Beta[:, test_idx]
+    coefs = fit.beta[:, test_idx]
 
     # Log2 fold change (coefficient is on log scale), capped at ±10
     log2fc = np.clip(coefs / np.log(2), -10.0, 10.0)
@@ -448,16 +491,9 @@ def test_de(
         reduced_design = fit.design_matrix[:, keep_cols]
 
     # Likelihood ratio test: refit reduced model and compare deviances.
-    # This matches R's glmGamPoi::test_de approach.
     reduced_jax = jnp.array(reduced_design)
     offset_jax = jnp.array(np.log(np.maximum(fit.size_factors, 1e-10)))
     n_coef_reduced = reduced_design.shape[1]
-
-    if fit.counts is None:
-        raise ValueError(
-            "Count matrix not stored in GLMGPResult. "
-            "Re-run glm_gp to obtain a fit with stored counts."
-        )
 
     # Use dispersion trend if available (matching R), else MLE
     disp_vec = (
@@ -466,7 +502,9 @@ def test_de(
         else jnp.array(fit.overdispersions)
     )
 
-    counts_jax = jnp.array(fit.counts.astype(np.float64))
+    # Get counts from adata (not stored on fit)
+    X = _get_layer(adata, fit.layer)
+    counts_jax = jnp.array(_to_dense(X).astype(np.float64))
     sf_jax = jnp.array(fit.size_factors)
 
     # Batch refit reduced model
@@ -480,7 +518,7 @@ def test_de(
         # Multi-coef reduced model — batch Newton-Raphson
         init_betas_r = jnp.zeros((n_genes, n_coef_reduced))
         # Initialize intercept from full model
-        init_betas_r = init_betas_r.at[:, 0].set(jnp.array(fit.Beta[:, 0]))
+        init_betas_r = init_betas_r.at[:, 0].set(jnp.array(fit.beta[:, 0]))
         _, deviances_reduced_jax, _ = fit_beta_newton_batch(
             counts_jax, reduced_jax, offset_jax, disp_vec, init_betas_r,
             100, 1e-8,
@@ -510,7 +548,7 @@ def test_de(
     padj = np.ones_like(pvals)
     if valid_pvals.sum() > 0:
         padj[valid_pvals] = sm.stats.multipletests(
-            pvals[valid_pvals], method=pval_adjust_method
+            pvals[valid_pvals], method=multitest_method
         )[1]
 
     # Create results DataFrame
@@ -531,3 +569,117 @@ def test_de(
     results = results.sort_values("pval").reset_index(drop=True)
 
     return results
+
+
+def nb_de(
+    adata: AnnData,
+    condition_key: str | None = None,
+    formula: str | None = None,
+    design: np.ndarray | None = None,
+    design_column_names: list[str] | None = None,
+    reference: str | None = None,
+    covariate_keys: list[str] | None = None,
+    size_factors: str | np.ndarray | None = "normed_sum",
+    layer: str | None = None,
+    contrast: str | int | None = None,
+    multitest_method: str = "fdr_bh",
+    lfc_threshold: float = 0.0,
+    overdispersion: bool = True,
+    batch_size: int = 512,
+    maxiter: int = 100,
+    verbose: bool = True,
+    overdispersion_shrinkage: bool = True,
+    do_cox_reid_adjustment: bool = True,
+) -> pd.DataFrame:
+    """One-shot negative binomial DE: fit model and test in one call.
+
+    Convenience wrapper around :func:`nb_fit` + :func:`nb_test`.
+    For reusing a fit across multiple contrasts, call them separately.
+
+    Parameters
+    ----------
+    adata : AnnData
+        AnnData object containing count data.
+    condition_key : str | None, default=None
+        Column in ``adata.obs`` for condition labels. Mutually exclusive
+        with ``formula``.
+    formula : str | None, default=None
+        R-style formula for the design matrix (e.g., ``"~ treatment + batch"``).
+        Mutually exclusive with ``condition_key``.
+    design : np.ndarray | None, default=None
+        Custom design matrix. Overrides ``condition_key`` and ``formula``.
+    design_column_names : list[str] | None, default=None
+        Column names for a custom ``design`` matrix.
+    reference : str | None, default=None
+        Reference level for the condition.
+    covariate_keys : list[str] | None, default=None
+        Columns in ``adata.obs`` to include as covariates.
+    size_factors : str | np.ndarray | None, default="normed_sum"
+        Size factors for normalization.
+    layer : str | None, default=None
+        Layer in ``adata.layers`` containing counts.
+    contrast : str | int | None, default=None
+        Contrast to test (passed to :func:`nb_test`).
+    multitest_method : str, default="fdr_bh"
+        Method for multiple testing correction.
+    lfc_threshold : float, default=0.0
+        Minimum absolute log2 fold change threshold.
+    overdispersion : bool, default=True
+        Whether to estimate overdispersion.
+    batch_size : int, default=512
+        Number of genes per batch.
+    maxiter : int, default=100
+        Maximum iterations for Newton-Raphson.
+    verbose : bool, default=True
+        Whether to show progress.
+    overdispersion_shrinkage : bool, default=True
+        Whether to apply quasi-likelihood shrinkage.
+    do_cox_reid_adjustment : bool, default=True
+        Whether to apply Cox-Reid adjustment.
+
+    Returns
+    -------
+    pd.DataFrame
+        DE results (same as :func:`nb_test`).
+
+    Examples
+    --------
+    Simple condition comparison:
+
+    >>> results = dx.tl.nb_de(adata, condition_key="treatment", reference="control")
+
+    Formula-based with covariates:
+
+    >>> results = dx.tl.nb_de(adata, formula="~ treatment + batch",
+    ...                       contrast="treatment[T.drugA]")
+    """
+    fit = nb_fit(
+        adata,
+        condition_key=condition_key,
+        formula=formula,
+        design=design,
+        design_column_names=design_column_names,
+        reference=reference,
+        covariate_keys=covariate_keys,
+        size_factors=size_factors,
+        layer=layer,
+        overdispersion=overdispersion,
+        batch_size=batch_size,
+        maxiter=maxiter,
+        verbose=verbose,
+        overdispersion_shrinkage=overdispersion_shrinkage,
+        do_cox_reid_adjustment=do_cox_reid_adjustment,
+    )
+    return nb_test(
+        adata,
+        fit,
+        contrast=contrast,
+        multitest_method=multitest_method,
+        lfc_threshold=lfc_threshold,
+    )
+
+
+# Deprecated aliases
+GLMGPResult = NBFitResult
+glm_gp = nb_fit
+glm_gp_test = nb_test
