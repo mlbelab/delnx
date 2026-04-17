@@ -635,12 +635,14 @@ class TestQuasiLikelihood:
         n_genes = 1000
         np.random.seed(42)
 
-        # Simulate QL dispersions from chi-square distribution
+        # Simulate QL dispersions as s2/var0 ~ F(df_residual, df0)
+        # so s2 = var0 * F(df_residual, df0)
         true_df0 = 20
         true_s0_sq = 1.0
-        ql_dispersions = stats.chi2.rvs(true_df0, size=n_genes) / true_df0 * true_s0_sq
+        df_residual = 10
+        ql_dispersions = true_s0_sq * stats.f.rvs(df_residual, true_df0, size=n_genes)
 
-        df0_est, s0_sq_est = _estimate_prior_df(ql_dispersions, df_residual=10)
+        df0_est, s0_sq_est = _estimate_prior_df(ql_dispersions, df_residual=df_residual)
 
         assert df0_est > 0, f"Estimated df0 should be positive, got {df0_est}"
         assert s0_sq_est > 0, f"Estimated s0_sq should be positive, got {s0_sq_est}"

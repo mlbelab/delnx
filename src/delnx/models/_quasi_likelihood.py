@@ -335,6 +335,7 @@ def _estimate_prior_df(
             neg_loglik,
             x0=[0.0, 0.0],
             method="L-BFGS-B",
+            bounds=[(-10, 10), (-5, np.log(1000))],
             options={"maxiter": 500, "ftol": 1e-10},
         )
         s0_sq = np.exp(result.x[0])
