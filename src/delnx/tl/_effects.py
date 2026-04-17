@@ -206,64 +206,72 @@ def log2fc(
 
 @jax.jit
 def _auroc(x: jnp.ndarray, groups: jnp.ndarray) -> float:
-    """Calculate AUROC (Area Under the ROC Curve) for a single feature.
+    """Calculate AUROC via Mann-Whitney U statistic.
 
-    This internal JAX-accelerated function computes the AUROC value for a single feature
-    across two conditions. The implementation handles tied values and is optimized for
-    performance with JIT compilation.
+    Computes AUROC as U / (n_pos * n_neg) where U is derived from the
+    rank sum of positive samples. This is O(n log n) from the sort for
+    ranking but avoids the more expensive ROC-curve construction.
 
     Parameters
     ----------
     x : jnp.ndarray
-        Feature expression values for samples from both conditions, shape (n_samples,).
+        Feature expression values, shape (n_samples,).
     groups : jnp.ndarray
-        Binary indicator array of shape (n_samples,) specifying group membership:
-        - 1 for samples in the test condition
-        - 0 for samples in the reference condition
+        Binary group labels (1=test, 0=reference), shape (n_samples,).
 
     Returns
     -------
     float
-        Area under the ROC curve, a value between 0 and 1 where:
-        - 0.5 indicates no separation between conditions
-        - 1.0 indicates perfect separation (higher values in test condition)
-        - 0.0 indicates perfect separation (higher values in reference condition)
-
-    Notes
-    -----
-    The implementation uses the trapezoidal rule for calculating the area under
-    the curve and handles ties in the expression values.
+        AUROC value in [0, 1].
     """
-    # Sort scores and corresponding truth values (highest scores first)
-    desc_score_indices = jnp.argsort(x)[::-1]
-    x = x[desc_score_indices]
-    groups = groups[desc_score_indices]
+    n = x.shape[0]
+    n_pos = jnp.sum(groups)
+    n_neg = n - n_pos
 
-    # x typically has many tied values. Here we extract
-    # the indices associated with the distinct values. We also
-    # concatenate a value for the end of the curve.
-    distinct_value_indices = jnp.array(jnp.diff(x) != 0, dtype=jnp.int32)
-    threshold_mask = jnp.r_[distinct_value_indices, 1]
+    # Average rank (1-based) using argsort-of-argsort
+    order = jnp.argsort(x)
+    ranks = jnp.empty_like(x)
+    ranks = ranks.at[order].set(jnp.arange(1, n + 1, dtype=x.dtype))
 
-    # Accumulate the true positives with decreasing threshold
-    tps_ = jnp.cumsum(groups)  # True positives
-    fps_ = 1 + jnp.arange(groups.size) - tps_  # False positives
+    # Handle ties: average ranks for identical values
+    sorted_x = x[order]
+    # Mark boundaries where values change
+    same = jnp.concatenate([jnp.array([False]), sorted_x[1:] == sorted_x[:-1]])
+    # Compute average ranks for tie groups via cumulative approach
+    # For each run of identical values, replace with their mean rank
+    avg_ranks = jnp.where(same, 0.0, ranks[order])
+    # Forward-fill approach: use segment-based averaging
+    # Simple approach: use the fact that for ties, rank = (first + last) / 2
+    # which equals the average of the 1-based positions
+    # scipy rankdata 'average' method — replicate via sorted values
+    # Use a simpler approach: compute via sorted unique boundaries
+    tie_adj_ranks = jnp.zeros_like(ranks)
+    sorted_ranks = jnp.arange(1, n + 1, dtype=x.dtype)
 
-    # Mask out the values that are not distinct
-    tps = jnp.sort(tps_ * threshold_mask)
-    fps = jnp.sort(fps_ * threshold_mask)
+    # Group consecutive equal values and assign mean rank
+    # Identify group starts
+    diff = jnp.concatenate([jnp.array([True]), sorted_x[1:] != sorted_x[:-1]])
+    # Cumulative sum to get group IDs (0-based)
+    group_ids = jnp.cumsum(diff) - 1
 
-    # Prepend 0 to start the curve at the origin
-    tps = jnp.r_[0, tps]
-    fps = jnp.r_[0, fps]
+    # Sum of ranks per group and count per group
+    n_groups = group_ids[-1] + 1
+    group_sums = jnp.zeros(n, dtype=x.dtype).at[group_ids].add(sorted_ranks)
+    group_counts = jnp.zeros(n, dtype=x.dtype).at[group_ids].add(1.0)
 
-    # Calculate TPR and FPR
-    fpr = fps / fps[-1]
-    tpr = tps / tps[-1]
+    # Mean rank per group, then broadcast back
+    group_means = group_sums / jnp.maximum(group_counts, 1.0)
+    avg_rank_sorted = group_means[group_ids]
 
-    # Calculate area using trapezoidal rule
-    area = jnp.trapezoid(tpr, fpr)
-    return area
+    # Map back to original order
+    final_ranks = jnp.empty_like(x)
+    final_ranks = final_ranks.at[order].set(avg_rank_sorted)
+
+    # Mann-Whitney U
+    rank_sum_pos = jnp.sum(final_ranks * groups)
+    U = rank_sum_pos - n_pos * (n_pos + 1) / 2
+    auroc = U / jnp.maximum(n_pos * n_neg, 1e-10)
+    return jnp.clip(auroc, 0.0, 1.0)
 
 
 _auroc_batch = jax.vmap(_auroc, in_axes=[1, None])

@@ -8,22 +8,17 @@ import delnx as dx
 def test_plot_volcanoplot(adata_pb_counts):
     """Test plotting of volcanoplot."""
 
-    # Compute size factors
-    dx.pp.size_factors(adata_pb_counts, method="ratio")
+    def nb_de(adata, **kw):
+        fit = dx.tl.nb_fit(adata, **kw)
+        return dx.tl.nb_test(adata, fit)
 
-    # Estimate dispersion parameters
-    dx.pp.dispersion(adata_pb_counts, size_factor_key="size_factors", method="deseq2")
-
-    # Run differential expression analysis
-    results = dx.tl.de(
+    # Run grouped NB DE analysis
+    results = dx.tl.grouped(
+        nb_de,
         adata_pb_counts,
-        condition_key="condition",
         group_key="cell_type",
-        mode="all_vs_ref",
+        condition_key="condition",
         reference="control",
-        method="negbinom",
-        size_factor_key="size_factors",
-        dispersion_key="dispersion",
     )
 
     # Select one cell type at a time

@@ -1,7 +1,8 @@
-"""Tests for glmGamPoi-style models."""
+"""Tests for negative binomial DE models."""
 
 import jax.numpy as jnp
 import numpy as np
+import pandas as pd
 import pytest
 from scipy import stats
 
@@ -366,7 +367,7 @@ class TestNegativeLogLikelihood:
 
 
 class TestGLMGPIntegration:
-    """Integration tests for glm_gp and test_de functions."""
+    """Integration tests for nb_fit and nb_test functions."""
 
     @pytest.fixture
     def simple_adata(self):
@@ -428,11 +429,11 @@ class TestGLMGPIntegration:
 
         return adata
 
-    def test_glm_gp_basic(self, simple_adata):
-        """Test basic glm_gp fitting."""
-        from delnx.tl._glm_gp import glm_gp
+    def test_nb_fit_basic(self, simple_adata):
+        """Test basic nb_fit fitting."""
+        from delnx.tl._glm_gp import nb_fit
 
-        fit = glm_gp(
+        fit = nb_fit(
             simple_adata,
             condition_key="group",
             verbose=False,
@@ -442,35 +443,35 @@ class TestGLMGPIntegration:
         n_samples = simple_adata.n_obs
 
         # Check output shapes
-        assert fit.Beta.shape == (n_genes, 2), f"Beta shape: {fit.Beta.shape}"
+        assert fit.beta.shape == (n_genes, 2), f"beta shape: {fit.beta.shape}"
         assert fit.overdispersions.shape == (n_genes,)
-        assert fit.Mu.shape == (n_samples, n_genes)
+        assert fit.mu.shape == (n_samples, n_genes)
         assert fit.size_factors.shape == (n_samples,)
         assert fit.deviances.shape == (n_genes,)
 
         # Check values are reasonable
         assert np.all(fit.overdispersions >= 0), "Dispersions should be non-negative"
-        assert np.all(fit.Mu > 0), "Mu should be positive"
+        assert np.all(fit.mu > 0), "mu should be positive"
         assert np.all(fit.size_factors > 0), "Size factors should be positive"
 
-    def test_glm_gp_intercept_only(self, simple_adata):
-        """Test glm_gp with intercept-only model."""
-        from delnx.tl._glm_gp import glm_gp
+    def test_nb_fit_intercept_only(self, simple_adata):
+        """Test nb_fit with intercept-only model."""
+        from delnx.tl._glm_gp import nb_fit
 
-        fit = glm_gp(
+        fit = nb_fit(
             simple_adata,
             condition_key=None,  # Intercept only
             verbose=False,
         )
 
-        assert fit.Beta.shape[1] == 1, "Should have only intercept"
-        assert np.all(np.isfinite(fit.Beta)), "Coefficients should be finite"
+        assert fit.beta.shape[1] == 1, "Should have only intercept"
+        assert np.all(np.isfinite(fit.beta)), "Coefficients should be finite"
 
-    def test_glm_gp_no_shrinkage(self, simple_adata):
-        """Test glm_gp without QL shrinkage."""
-        from delnx.tl._glm_gp import glm_gp
+    def test_nb_fit_no_shrinkage(self, simple_adata):
+        """Test nb_fit without QL shrinkage."""
+        from delnx.tl._glm_gp import nb_fit
 
-        fit = glm_gp(
+        fit = nb_fit(
             simple_adata,
             condition_key="group",
             overdispersion_shrinkage=False,
@@ -480,11 +481,11 @@ class TestGLMGPIntegration:
         assert fit.ql_dispersions is None, "QL dispersions should be None"
         assert fit.df0_prior == 0.0, "Prior df should be 0"
 
-    def test_glm_gp_with_shrinkage(self, overdispersed_adata):
-        """Test glm_gp with QL shrinkage."""
-        from delnx.tl._glm_gp import glm_gp
+    def test_nb_fit_with_shrinkage(self, overdispersed_adata):
+        """Test nb_fit with QL shrinkage."""
+        from delnx.tl._glm_gp import nb_fit
 
-        fit = glm_gp(
+        fit = nb_fit(
             overdispersed_adata,
             condition_key="treatment",
             overdispersion_shrinkage=True,
@@ -498,17 +499,17 @@ class TestGLMGPIntegration:
         assert fit.dispersion_trend is not None, "Should have dispersion trend"
         assert fit.df0_prior > 0, "Prior df should be positive"
 
-    def test_test_de_basic(self, simple_adata):
+    def test_nb_test_basic(self, simple_adata):
         """Test basic differential expression testing."""
-        from delnx.tl._glm_gp import glm_gp, test_de
+        from delnx.tl._glm_gp import nb_fit, nb_test
 
-        fit = glm_gp(
+        fit = nb_fit(
             simple_adata,
             condition_key="group",
             verbose=False,
         )
 
-        results = test_de(fit)
+        results = nb_test(simple_adata, fit)
 
         # Check output structure
         assert "feature" in results.columns
@@ -521,17 +522,17 @@ class TestGLMGPIntegration:
         assert np.all(results["pval"] >= 0) and np.all(results["pval"] <= 1)
         assert np.all(results["padj"] >= 0) and np.all(results["padj"] <= 1)
 
-    def test_test_de_detects_de_genes(self, simple_adata):
+    def test_nb_test_detects_de_genes(self, simple_adata):
         """Test that DE genes are detected."""
-        from delnx.tl._glm_gp import glm_gp, test_de
+        from delnx.tl._glm_gp import nb_fit, nb_test
 
-        fit = glm_gp(
+        fit = nb_fit(
             simple_adata,
             condition_key="group",
             verbose=False,
         )
 
-        results = test_de(fit)
+        results = nb_test(simple_adata, fit)
 
         # First 20 genes should be DE (we added 2-fold change)
         de_genes = [f"gene_{i}" for i in range(20)]
@@ -545,18 +546,18 @@ class TestGLMGPIntegration:
         mean_lfc = de_results["log2fc"].mean()
         assert mean_lfc > 0.5, f"DE genes should have positive log2fc, got {mean_lfc}"
 
-    def test_test_de_with_ql(self, overdispersed_adata):
+    def test_nb_test_with_ql(self, overdispersed_adata):
         """Test DE testing with QL shrinkage."""
-        from delnx.tl._glm_gp import glm_gp, test_de
+        from delnx.tl._glm_gp import nb_fit, nb_test
 
-        fit = glm_gp(
+        fit = nb_fit(
             overdispersed_adata,
             condition_key="treatment",
             overdispersion_shrinkage=True,
             verbose=False,
         )
 
-        results = test_de(fit, contrast=1)  # Test first treatment vs control
+        results = nb_test(overdispersed_adata, fit, contrast=1)  # Test first treatment vs control
 
         assert len(results) == overdispersed_adata.n_vars
         assert np.all(np.isfinite(results["pval"]))
@@ -731,6 +732,193 @@ class TestQuasiLikelihood:
         # Less than 10% should be < 0.05 under null (with some tolerance)
         prop_sig = np.mean(pvals < 0.05)
         assert prop_sig < 0.15, f"Too many significant under null: {prop_sig}"
+
+
+class TestNbDe:
+    """Tests for nb_de convenience wrapper."""
+
+    @pytest.fixture
+    def simple_adata(self):
+        """Create simple AnnData for testing."""
+        import anndata
+
+        np.random.seed(42)
+        n_samples, n_genes = 50, 100
+        group = np.array(["A"] * 25 + ["B"] * 25)
+        base_expr = np.random.poisson(20, (n_samples, n_genes)).astype(float)
+        base_expr[25:, :20] *= 2.0
+        adata = anndata.AnnData(X=base_expr)
+        adata.obs["group"] = group
+        adata.var_names = [f"gene_{i}" for i in range(n_genes)]
+        return adata
+
+    def test_nb_de_basic(self, simple_adata):
+        """Test nb_de one-shot wrapper."""
+        from delnx.tl import nb_de
+
+        results = nb_de(simple_adata, condition_key="group")
+        assert isinstance(results, pd.DataFrame)
+        assert len(results) > 0
+        assert all(col in results.columns for col in ["feature", "log2fc", "coef", "pval", "padj"])
+
+    def test_nb_de_matches_two_step(self, simple_adata):
+        """Test that nb_de matches nb_fit + nb_test."""
+        from delnx.tl import nb_de, nb_fit, nb_test
+
+        one_shot = nb_de(simple_adata, condition_key="group")
+        fit = nb_fit(simple_adata, condition_key="group")
+        two_step = nb_test(simple_adata, fit)
+
+        assert len(one_shot) == len(two_step)
+        merged = one_shot.merge(two_step, on="feature", suffixes=("_1", "_2"))
+        assert np.allclose(merged["pval_1"].values, merged["pval_2"].values, rtol=1e-10)
+
+
+class TestNbFormula:
+    """Tests for formula-based nb_fit/nb_test/nb_de."""
+
+    @pytest.fixture
+    def adata_with_batch(self):
+        """Create AnnData with treatment and batch factors."""
+        import anndata
+
+        np.random.seed(42)
+        n_samples, n_genes = 60, 80
+
+        treatment = np.array(["ctrl"] * 20 + ["drugA"] * 20 + ["drugB"] * 20)
+        batch = np.tile(["b1", "b2"], 30)
+
+        base_expr = np.random.poisson(20, (n_samples, n_genes)).astype(float)
+        # drugA upregulates first 15 genes
+        base_expr[20:40, :15] *= 2.0
+        # drugB upregulates genes 15-25
+        base_expr[40:60, 15:25] *= 2.0
+
+        adata = anndata.AnnData(X=base_expr)
+        adata.obs["treatment"] = treatment
+        adata.obs["batch"] = batch
+        adata.obs["age"] = np.random.normal(50, 10, n_samples)
+        adata.var_names = [f"gene_{i}" for i in range(n_genes)]
+        return adata
+
+    def test_nb_fit_formula_simple(self, adata_with_batch):
+        """Formula '~ treatment' should match condition_key='treatment'."""
+        from delnx.tl._glm_gp import nb_fit
+
+        fit_formula = nb_fit(adata_with_batch, formula="~ treatment", verbose=False)
+        fit_ckey = nb_fit(adata_with_batch, condition_key="treatment", verbose=False)
+
+        # Same number of coefficients (intercept + 2 treatment levels)
+        assert fit_formula.beta.shape[1] == fit_ckey.beta.shape[1]
+        assert len(fit_formula.design_column_names) == 3
+        assert "Intercept" in fit_formula.design_column_names
+
+    def test_nb_fit_formula_with_covariates(self, adata_with_batch):
+        """Formula '~ treatment + batch' should produce 4 coefficients."""
+        from delnx.tl._glm_gp import nb_fit
+
+        fit = nb_fit(adata_with_batch, formula="~ treatment + batch", verbose=False)
+        # Intercept + treatment[T.drugA] + treatment[T.drugB] + batch[T.b2]
+        assert fit.beta.shape[1] == 4
+        assert len(fit.design_column_names) == 4
+
+    def test_nb_fit_formula_reference(self, adata_with_batch):
+        """Reference should change which level becomes intercept."""
+        from delnx.tl._glm_gp import nb_fit
+
+        fit = nb_fit(
+            adata_with_batch, formula="~ treatment",
+            condition_key=None, reference=None, verbose=False,
+        )
+        # Default alphabetical: ctrl is reference → drugA, drugB as dummies
+        assert "treatment[T.drugA]" in fit.design_column_names
+        assert "treatment[T.drugB]" in fit.design_column_names
+
+    def test_nb_test_formula_contrast(self, adata_with_batch):
+        """String contrast should work with formula-based fit."""
+        from delnx.tl._glm_gp import nb_fit, nb_test
+
+        fit = nb_fit(adata_with_batch, formula="~ treatment + batch", verbose=False)
+        results = nb_test(adata_with_batch, fit, contrast="treatment[T.drugA]")
+
+        assert len(results) == adata_with_batch.n_vars
+        assert all(col in results.columns for col in ["feature", "log2fc", "pval", "padj"])
+
+        # drugA upregulated first 15 genes — should detect some
+        de_genes = [f"gene_{i}" for i in range(15)]
+        de_results = results[results["feature"].isin(de_genes)]
+        n_sig = (de_results["pval"] < 0.05).sum()
+        assert n_sig > 5, f"Should detect DE genes, got {n_sig}/15"
+
+    def test_nb_test_invalid_contrast(self, adata_with_batch):
+        """Invalid contrast name should raise ValueError."""
+        from delnx.tl._glm_gp import nb_fit, nb_test
+
+        fit = nb_fit(adata_with_batch, formula="~ treatment", verbose=False)
+        with pytest.raises(ValueError, match="not found in design columns"):
+            nb_test(adata_with_batch, fit, contrast="nonexistent")
+
+    def test_nb_fit_formula_continuous(self, adata_with_batch):
+        """Formula with continuous variable should work."""
+        from delnx.tl._glm_gp import nb_fit, nb_test
+
+        fit = nb_fit(adata_with_batch, formula="~ age", verbose=False)
+        assert fit.beta.shape[1] == 2  # Intercept + age
+        assert "age" in fit.design_column_names
+
+        results = nb_test(adata_with_batch, fit, contrast="age")
+        assert len(results) == adata_with_batch.n_vars
+
+    def test_nb_fit_mutual_exclusivity(self, adata_with_batch):
+        """formula + condition_key should raise ValueError."""
+        from delnx.tl._glm_gp import nb_fit
+
+        with pytest.raises(ValueError, match="either.*formula.*condition_key"):
+            nb_fit(adata_with_batch, formula="~ treatment", condition_key="treatment", verbose=False)
+
+    def test_nb_de_formula(self, adata_with_batch):
+        """nb_de should accept formula and contrast."""
+        from delnx.tl import nb_de
+
+        results = nb_de(
+            adata_with_batch,
+            formula="~ treatment + batch",
+            contrast="treatment[T.drugA]",
+            verbose=False,
+        )
+        assert isinstance(results, pd.DataFrame)
+        assert len(results) > 0
+        assert all(col in results.columns for col in ["feature", "log2fc", "pval", "padj"])
+
+    def test_nb_fit_custom_design(self, adata_with_batch):
+        """Custom design matrix should work with design_column_names."""
+        from delnx.tl._glm_gp import nb_fit, nb_test
+
+        n = adata_with_batch.n_obs
+        design = np.column_stack([
+            np.ones(n),
+            (adata_with_batch.obs["treatment"].values == "drugA").astype(float),
+        ])
+        fit = nb_fit(
+            adata_with_batch, design=design,
+            design_column_names=["Intercept", "drugA"],
+            verbose=False,
+        )
+        assert fit.beta.shape[1] == 2
+        results = nb_test(adata_with_batch, fit, contrast="drugA")
+        assert len(results) == adata_with_batch.n_vars
+
+
+class TestDeprecatedAliases:
+    """Tests for deprecated aliases."""
+
+    def test_aliases_resolve(self):
+        """Test that old names still work."""
+        import delnx as dx
+
+        assert dx.tl.glm_gp is dx.tl.nb_fit
+        assert dx.tl.glm_gp_test is dx.tl.nb_test
+        assert dx.tl.GLMGPResult is dx.tl.NBFitResult
 
 
 if __name__ == "__main__":
