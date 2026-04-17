@@ -211,9 +211,10 @@ def _process_batch(
     tie_corrections_jax = jnp.asarray(tie_corrections, dtype=jnp.float32)
 
     aucs, z_scores = _auroc_batch_with_ties(X_dense, one_hot, zero_ranks_jax, tie_corrections_jax)
-    pvals = 2 * stats.norm.sf(z_scores)
+    pvals = 2 * jax.scipy.stats.norm.sf(z_scores)
 
-    return np.array(aucs), np.array(pvals), np.array(z_scores)
+    # Single device-to-host transfer
+    return np.asarray(aucs), np.asarray(pvals), np.asarray(z_scores)
 
 
 def _validate_inputs(adata: AnnData, condition_key: str, min_samples: int) -> list[str]:
