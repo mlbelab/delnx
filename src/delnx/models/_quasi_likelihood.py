@@ -13,7 +13,6 @@ References
 
 import numpy as np
 from scipy import optimize, stats
-from scipy.special import polygamma
 
 
 # =============================================================================
@@ -67,27 +66,76 @@ def compute_ql_dispersions(
 # =============================================================================
 
 
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """Compute weighted median (matching R's matrixStats::weightedMedian)."""
+    sorted_idx = np.argsort(values)
+    sorted_vals = values[sorted_idx]
+    sorted_w = weights[sorted_idx]
+    cumw = np.cumsum(sorted_w)
+    half = cumw[-1] / 2.0
+    idx = np.searchsorted(cumw, half)
+    return sorted_vals[min(idx, len(sorted_vals) - 1)]
+
+
+def _weighted_median_vectorized(windows: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Compute weighted median for all windows at once.
+
+    Parameters
+    ----------
+    windows : np.ndarray
+        Shape (n_windows, window_size).
+    weights : np.ndarray
+        Shape (window_size,).
+
+    Returns
+    -------
+    np.ndarray
+        Weighted medians, shape (n_windows,).
+    """
+    # Sort each window independently
+    sorted_idx = np.argsort(windows, axis=1)
+    sorted_vals = np.take_along_axis(windows, sorted_idx, axis=1)
+    sorted_w = weights[sorted_idx]  # broadcast weights via sorted indices
+
+    cumw = np.cumsum(sorted_w, axis=1)
+    half = cumw[:, -1:] / 2.0
+
+    # Find first index where cumulative weight >= half
+    # mask: True where cumw >= half
+    mask = cumw >= half
+    # argmax on mask gives first True index per row
+    med_idx = np.argmax(mask, axis=1)
+
+    return sorted_vals[np.arange(len(windows)), med_idx]
+
+
 def loc_median_fit(
     x: np.ndarray,
     y: np.ndarray,
-    fraction: float = 0.3,
-    n_bins: int = 50,
+    fraction: float = 0.1,
+    npoints: int | None = None,
+    weighted: bool = True,
 ) -> np.ndarray:
     """Fit a robust local median trend.
 
-    This is a simplified version of the local median fit used in glmGamPoi
-    for estimating dispersion trends. It's more robust to outliers than loess.
+    Matches R's glmGamPoi:::loc_median_fit: sliding window of ``npoints``
+    elements with Gaussian-weighted medians, evaluated at every interior
+    point with edge-clamping.
+
+    Uses vectorized sliding windows via np.lib.stride_tricks for performance.
 
     Parameters
     ----------
     x : np.ndarray
-        Predictor values (e.g., log mean expression), shape (n_genes,).
+        Predictor values (e.g., mean expression), shape (n_genes,).
     y : np.ndarray
-        Response values (e.g., log dispersion), shape (n_genes,).
-    fraction : float, default=0.3
-        Fraction of data to use in each local window.
-    n_bins : int, default=50
-        Number of bins for computing local medians.
+        Response values (e.g., dispersion), shape (n_genes,).
+    fraction : float, default=0.1
+        Fraction of data for the window size (npoints = round(n * fraction)).
+    npoints : int | None, default=None
+        Window size. If None, computed from fraction.
+    weighted : bool, default=True
+        Use Gaussian-weighted median (matching R default).
 
     Returns
     -------
@@ -95,37 +143,63 @@ def loc_median_fit(
         Fitted trend values at each x, shape (n_genes,).
     """
     n = len(x)
+    if n == 0:
+        return np.array([])
 
-    # Handle edge cases
-    if n < 10:
-        return np.full(n, np.median(y))
+    if npoints is None:
+        npoints = max(1, round(n * fraction))
+    npoints = max(1, min(npoints, n))
 
-    # Create bins based on x values
-    x_sorted_idx = np.argsort(x)
-    x_sorted = x[x_sorted_idx]
-    y_sorted = y[x_sorted_idx]
+    ordered_indices = np.argsort(x)
+    ordered_y = y[ordered_indices]
 
-    # Compute bin edges
-    bin_edges = np.linspace(0, n - 1, n_bins + 1).astype(int)
+    half_points = npoints // 2
+    window_size = half_points * 2 + 1
 
-    # Compute median for each bin
-    bin_centers = np.zeros(n_bins)
-    bin_medians = np.zeros(n_bins)
+    # Gaussian weights for the window
+    if weighted:
+        weights = stats.norm.pdf(np.linspace(-3, 3, window_size))
+    else:
+        weights = np.ones(window_size)
 
-    for i in range(n_bins):
-        start = bin_edges[i]
-        end = bin_edges[i + 1] if i < n_bins - 1 else n
-        if end > start:
-            bin_centers[i] = np.median(x_sorted[start:end])
-            bin_medians[i] = np.median(y_sorted[start:end])
+    start = half_points
+    end = n - 1 - half_points
+
+    if end < start:
+        # Window larger than data
+        if weighted:
+            w = stats.norm.pdf(np.linspace(-3, 3, n))
+            wm = _weighted_median(ordered_y, w)
         else:
-            bin_centers[i] = x_sorted[start] if start < n else x_sorted[-1]
-            bin_medians[i] = y_sorted[start] if start < n else y_sorted[-1]
+            wm = np.median(ordered_y)
+        return np.full(n, wm)
 
-    # Interpolate to get trend at each original x
-    trend = np.interp(x, bin_centers, bin_medians)
+    # Build all windows at once using stride_tricks
+    # This creates a view (no copy) of shape (n_windows, window_size)
+    n_windows = end - start + 1
+    windows = np.lib.stride_tricks.as_strided(
+        ordered_y[start - half_points:],
+        shape=(n_windows, window_size),
+        strides=(ordered_y.strides[0], ordered_y.strides[0]),
+    ).copy()  # copy to avoid issues with non-contiguous memory in argsort
 
-    return trend
+    # Compute all weighted medians vectorized
+    if weighted:
+        medians = _weighted_median_vectorized(windows, weights)
+    else:
+        medians = np.median(windows, axis=1)
+
+    res = np.empty(n)
+    res[start:end + 1] = medians
+
+    # Edge clamping
+    res[:start] = res[start]
+    res[end + 1:] = res[end]
+
+    # Unsort: map back to original order
+    result = np.empty(n)
+    result[ordered_indices] = res
+    return result
 
 
 def fit_dispersion_trend(
@@ -155,28 +229,35 @@ def fit_dispersion_trend(
 
     if valid_mask.sum() < 10:
         # Not enough valid genes, return mean
-        return np.full_like(dispersions, np.median(dispersions[valid_mask]))
+        return np.full_like(dispersions, np.mean(dispersions[valid_mask]))
 
     if method == "mean":
-        return np.full_like(dispersions, np.median(dispersions[valid_mask]))
+        return np.full_like(dispersions, np.mean(dispersions[valid_mask]))
 
     elif method == "local_median":
-        # Fit in log-log space
-        log_mean = np.log10(mean_expression[valid_mask])
-        log_disp = np.log10(dispersions[valid_mask])
-
-        # Fit local median
-        log_trend_valid = loc_median_fit(log_mean, log_disp)
-
-        # Interpolate back to all genes
-        log_mean_all = np.log10(np.maximum(mean_expression, 1e-10))
-        log_trend_all = np.interp(
-            log_mean_all,
-            log_mean[np.argsort(log_mean)],
-            log_trend_valid[np.argsort(log_mean)],
+        # R calls: loc_median_fit(gene_means[valid], y=disp_est[valid])
+        # Directly on the raw scale, not log-log
+        trend = np.full_like(dispersions, np.nan)
+        trend[valid_mask] = loc_median_fit(
+            mean_expression[valid_mask], dispersions[valid_mask]
         )
 
-        return 10 ** log_trend_all
+        # Fill invalid genes with nearest valid value
+        if (~valid_mask).any():
+            from scipy.interpolate import interp1d
+
+            valid_idx = np.where(valid_mask)[0]
+            invalid_idx = np.where(~valid_mask)[0]
+            fill_fn = interp1d(
+                mean_expression[valid_mask],
+                trend[valid_mask],
+                kind="nearest",
+                bounds_error=False,
+                fill_value=(trend[valid_mask][0], trend[valid_mask][-1]),
+            )
+            trend[invalid_idx] = fill_fn(mean_expression[invalid_idx])
+
+        return trend
 
     else:
         raise ValueError(f"Unknown trend method: {method}")
@@ -190,12 +271,12 @@ def fit_dispersion_trend(
 def _estimate_prior_df(
     ql_dispersions: np.ndarray,
     df_residual: int,
-    robust: bool = True,
 ) -> tuple[float, float]:
-    """Estimate prior degrees of freedom for inverse chi-square distribution.
+    """Estimate prior degrees of freedom via F-distribution MLE.
 
-    This implements the empirical Bayes estimation of the prior distribution
-    parameters for quasi-likelihood dispersions.
+    Matches R's glmGamPoi:::variance_prior: jointly estimates variance0
+    and df0 by maximizing the F-distribution log-likelihood of
+    ``s2 / variance0 ~ F(df_residual, df0)``.
 
     Parameters
     ----------
@@ -203,75 +284,68 @@ def _estimate_prior_df(
         Quasi-likelihood dispersion estimates, shape (n_genes,).
     df_residual : int
         Residual degrees of freedom from the GLM fit.
-    robust : bool, default=True
-        Whether to use robust estimation (winsorization).
 
     Returns
     -------
     tuple[float, float]
         - df0: Prior degrees of freedom.
-        - s0_sq: Prior variance estimate.
+        - s0_sq: Prior variance estimate (variance0).
     """
-    # Filter valid dispersions
     valid = np.isfinite(ql_dispersions) & (ql_dispersions > 0)
-    ql_valid = ql_dispersions[valid]
+    s2 = ql_dispersions[valid]
 
-    if len(ql_valid) < 10:
-        # Not enough genes, return uninformative prior
+    if len(s2) < 10:
         return 0.0, 1.0
 
-    # Robust estimation: winsorize extreme values
-    if robust:
-        lower = np.percentile(ql_valid, 1)
-        upper = np.percentile(ql_valid, 99)
-        ql_valid = np.clip(ql_valid, lower, upper)
+    if np.all(s2 == 1.0):
+        return np.inf, 1.0
 
-    # Method of moments for inverse chi-square
-    # E[s^2] = s0^2 * df0 / (df0 - 2) for df0 > 2
-    # Var[s^2] = 2 * s0^4 * df0^2 / ((df0-2)^2 * (df0-4)) for df0 > 4
+    # Pre-compute log(s2) once — used in every evaluation
+    log_s2 = np.log(s2)
+    n = len(s2)
+    d1 = float(df_residual)
 
-    mean_s2 = np.mean(ql_valid)
-    var_s2 = np.var(ql_valid, ddof=1)
+    # Analytical F-distribution log-PDF (avoids scipy.stats.f overhead):
+    # log f(x; d1, d2) = 0.5*[d1*log(d1) + d2*log(d2)] + 0.5*(d1-2)*log(x)
+    #                   - 0.5*(d1+d2)*log(d1*x + d2) - log(B(d1/2, d2/2))
+    # where B is the beta function.
+    from scipy.special import betaln
 
-    # Estimate df0 using trigamma function
-    # Based on limma::fitFDist approach
-    log_ql = np.log(ql_valid)
-    mean_log = np.mean(log_ql)
+    def neg_loglik(par):
+        log_var0 = par[0]
+        d2 = np.exp(np.clip(par[1], -50, 50))
 
-    # E[log(s^2)] = log(s0^2) + digamma(df0/2) - log(df0/2)
-    # Var[log(s^2)] = trigamma(df0/2)
+        log_x = log_s2 - log_var0
 
-    var_log = np.var(log_ql, ddof=1)
-
-    # Solve for df0 using trigamma inverse
-    # trigamma(df0/2) = var_log
-    # Use numerical optimization
-    def objective(df0):
-        if df0 <= 0:
-            return 1e10
-        return (polygamma(1, df0 / 2) - var_log) ** 2
+        half_d1 = 0.5 * d1
+        half_d2 = 0.5 * d2
+        # F log-PDF (vectorized, no scipy.stats overhead)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            log_pdf = (
+                half_d1 * np.log(d1) + half_d2 * np.log(d2)
+                - betaln(half_d1, half_d2)
+                + (half_d1 - 1.0) * log_x
+                - (half_d1 + half_d2) * np.log(d1 * np.exp(np.clip(log_x, -500, 500)) + d2)
+            )
+        log_pdf = np.where(np.isfinite(log_pdf), log_pdf, -1e10)
+        return -np.sum(log_pdf - log_var0)
 
     try:
-        result = optimize.minimize_scalar(
-            objective,
-            bounds=(0.1, 1000),
-            method="bounded",
+        result = optimize.minimize(
+            neg_loglik,
+            x0=[0.0, 0.0],
+            method="L-BFGS-B",
+            options={"maxiter": 500, "ftol": 1e-10},
         )
-        df0 = result.x
+        s0_sq = np.exp(result.x[0])
+        df0 = np.exp(result.x[1])
     except Exception:
-        df0 = 10.0  # Default fallback
-
-    # Ensure df0 is reasonable
-    df0 = np.clip(df0, 0.1, 1000)
-
-    # Estimate s0^2
-    # s0^2 = mean(s^2) * (df0 - 2) / df0 for df0 > 2
-    if df0 > 2:
-        s0_sq = mean_s2 * (df0 - 2) / df0
-    else:
-        s0_sq = np.median(ql_valid)
+        # Fallback
+        s0_sq = np.median(s2)
+        df0 = 10.0
 
     s0_sq = max(s0_sq, 1e-10)
+    df0 = max(df0, 0.1)
 
     return df0, s0_sq
 

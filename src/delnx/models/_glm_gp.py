@@ -1,7 +1,9 @@
 """glmGamPoi-style negative binomial regression models in JAX.
 
 This module implements the core algorithms from the glmGamPoi R package,
-adapted for Python with JAX GPU acceleration.
+adapted for Python with JAX GPU acceleration. All core solvers use
+jax.lax.while_loop for full JIT-ability and are vmapped for batch
+processing across genes.
 
 References
 ----------
@@ -75,13 +77,21 @@ def compute_gp_deviance(
     return deviance
 
 
+# Batched deviance: genes along axis 1 of counts/mu, dispersions is (n_genes,)
+compute_gp_deviance_batch = jax.jit(jax.vmap(
+    compute_gp_deviance,
+    in_axes=(1, 1, 0),
+    out_axes=0,
+))
+
+
 # =============================================================================
-# Fisher-scoring beta estimation
+# Newton-Raphson beta estimation (fully JIT-able via lax.while_loop)
 # =============================================================================
 
 
-@partial(jax.jit, static_argnums=(5, 6, 7))
-def fit_beta_fisher_scoring(
+@partial(jax.jit, static_argnums=(5, 6))
+def fit_beta_newton(
     counts: jnp.ndarray,
     design: jnp.ndarray,
     offset: jnp.ndarray,
@@ -89,12 +99,11 @@ def fit_beta_fisher_scoring(
     init_beta: jnp.ndarray,
     maxiter: int = 100,
     tol: float = 1e-8,
-    max_line_search: int = 30,
 ) -> tuple[jnp.ndarray, float, bool]:
-    """Fit negative binomial GLM coefficients using Fisher-scoring.
+    """Fit NB GLM coefficients using Newton-Raphson with observed Hessian.
 
-    This implements the Fisher-scoring algorithm with line search,
-    following the glmGamPoi approach for robust convergence.
+    Fully JIT-able implementation using jax.lax.while_loop, enabling
+    vmap across genes for batch processing.
 
     Parameters
     ----------
@@ -109,11 +118,9 @@ def fit_beta_fisher_scoring(
     init_beta : jnp.ndarray
         Initial coefficient estimates, shape (n_coefficients,).
     maxiter : int, default=100
-        Maximum number of Fisher-scoring iterations.
+        Maximum number of Newton-Raphson iterations.
     tol : float, default=1e-8
-        Convergence tolerance for relative change in deviance.
-    max_line_search : int, default=30
-        Maximum number of line search halvings.
+        Convergence tolerance for maximum absolute change in beta.
 
     Returns
     -------
@@ -122,99 +129,79 @@ def fit_beta_fisher_scoring(
         - deviance: Final deviance.
         - converged: Whether the algorithm converged.
     """
-    n_samples, n_coef = design.shape
     dispersion = jnp.clip(dispersion, 1e-10, 1e10)
-    r = 1.0 / dispersion  # size parameter
 
-    def compute_mu(beta):
+    def newton_body(state):
+        i, beta, converged = state
+
         eta = design @ beta + offset
         eta = jnp.clip(eta, -50, 50)
-        return jnp.exp(eta)
+        mu = jnp.exp(eta)
+        mu = jnp.clip(mu, 1e-10, 1e50)
 
-    def fisher_step(state):
-        """Single Fisher-scoring iteration with line search."""
-        i, beta, deviance, converged = state
+        # Score (gradient of log-likelihood)
+        score = design.T @ ((counts - mu) / (1.0 + dispersion * mu))
 
-        mu = compute_mu(beta)
-        mu = jnp.clip(mu, 1e-50, 1e50)
+        # Observed Hessian: W_obs_i = mu_i * (1 + disp * y_i) / (1 + disp * mu_i)^2
+        W_obs = mu * (1.0 + dispersion * counts) / (1.0 + dispersion * mu) ** 2
+        W_obs = jnp.clip(W_obs, 1e-10, 1e10)
 
-        # Working weights: W = mu^2 / V where V = mu + disp * mu^2
-        # For NB: W = mu / (1 + disp * mu)
-        W = mu / (1.0 + dispersion * mu)
-        W = jnp.clip(W, 1e-10, 1e10)
+        H = design.T @ (design * W_obs[:, None])
+        H = H + jnp.eye(H.shape[0]) * 1e-6
 
-        # Working residuals: z = (y - mu) / mu (for log link)
-        residuals = (counts - mu) / mu
+        delta = jnp.linalg.solve(H, score)
 
-        # Score: X^T W (y - mu) / mu * mu = X^T W (y - mu)
-        # But we use working response formulation
-        # z_working = eta + (y - mu) / mu
-        eta = design @ beta + offset
-        z_working = eta + residuals
+        # Clamp step size
+        max_step = jnp.max(jnp.abs(delta))
+        scale = jnp.where(max_step > 5.0, 5.0 / max_step, 1.0)
+        delta = delta * scale
 
-        # Solve weighted least squares: (X^T W X) delta = X^T W z
-        W_sqrt = jnp.sqrt(W)
-        X_weighted = design * W_sqrt[:, None]
-        z_weighted = z_working * W_sqrt
+        beta_new = beta + delta
+        converged = jnp.max(jnp.abs(delta)) < tol
+        return (i + 1, beta_new, converged)
 
-        # QR decomposition for numerical stability
-        Q, R = jnp.linalg.qr(X_weighted)
-        beta_new = jsp.linalg.solve_triangular(R, Q.T @ z_weighted)
-
-        # Line search to ensure deviance decreases
-        def line_search_step(ls_state):
-            ls_i, step_size, beta_ls, dev_ls, improved = ls_state
-            beta_trial = beta + step_size * (beta_new - beta)
-            mu_trial = compute_mu(beta_trial)
-            mu_trial = jnp.clip(mu_trial, 1e-50, 1e50)
-            dev_trial = compute_gp_deviance(counts, mu_trial, dispersion)
-
-            # Check if deviance decreased
-            improved = dev_trial < deviance
-            # If not improved, halve step size
-            step_size_next = jnp.where(improved, step_size, step_size * 0.5)
-            beta_next = jnp.where(improved, beta_trial, beta_ls)
-            dev_next = jnp.where(improved, dev_trial, dev_ls)
-
-            return (ls_i + 1, step_size_next, beta_next, dev_next, improved)
-
-        def line_search_cond(ls_state):
-            ls_i, _, _, _, improved = ls_state
-            return jnp.logical_and(ls_i < max_line_search, ~improved)
-
-        # Initialize line search
-        ls_init = (0, 1.0, beta, deviance, False)
-        ls_final = jax.lax.while_loop(line_search_cond, line_search_step, ls_init)
-        _, _, beta_final, dev_final, _ = ls_final
-
-        # Check convergence
-        rel_change = jnp.abs(deviance - dev_final) / (jnp.abs(deviance) + 0.1)
-        converged = rel_change < tol
-
-        return (i + 1, beta_final, dev_final, converged)
-
-    def fisher_cond(state):
-        i, _, _, converged = state
+    def newton_cond(state):
+        i, _, converged = state
         return jnp.logical_and(i < maxiter, ~converged)
 
-    # Initialize
-    mu_init = compute_mu(init_beta)
-    mu_init = jnp.clip(mu_init, 1e-50, 1e50)
-    dev_init = compute_gp_deviance(counts, mu_init, dispersion)
+    init_state = (0, init_beta, False)
+    _, beta_final, converged = jax.lax.while_loop(newton_cond, newton_body, init_state)
 
-    init_state = (0, init_beta, dev_init, False)
-    final_state = jax.lax.while_loop(fisher_cond, fisher_step, init_state)
-    _, beta_final, deviance_final, converged = final_state
+    # Compute final deviance
+    eta = design @ beta_final + offset
+    eta = jnp.clip(eta, -50, 50)
+    mu_final = jnp.exp(eta)
+    mu_final = jnp.clip(mu_final, 1e-50, 1e50)
+    deviance_final = compute_gp_deviance(counts, mu_final, dispersion)
 
     return beta_final, deviance_final, converged
 
 
-# Batched version for multiple genes
-fit_beta_fisher_scoring_batch = jax.vmap(
-    fit_beta_fisher_scoring,
-    in_axes=(1, None, None, 0, 1, None, None, None),
-    out_axes=(1, 0, 0),
-)
+# Legacy alias for backward compatibility
+def fit_beta_fisher_scoring(
+    counts: jnp.ndarray,
+    design: jnp.ndarray,
+    offset: jnp.ndarray,
+    dispersion: float,
+    init_beta: jnp.ndarray,
+    maxiter: int = 100,
+    tol: float = 1e-8,
+) -> tuple[jnp.ndarray, float, bool]:
+    """Fit NB GLM coefficients (legacy wrapper for fit_beta_newton)."""
+    return fit_beta_newton(counts, design, offset, dispersion, init_beta, maxiter, tol)
+
+
+# Batched version: vmap across genes
+# counts: (n_samples, n_genes) -> vmap over axis 1
+# design: shared (n_samples, n_coef) -> not vmapped
+# offset: shared (n_samples,) -> not vmapped
+# dispersion: (n_genes,) -> vmap over axis 0
+# init_beta: (n_genes, n_coef) -> vmap over axis 0
+fit_beta_newton_batch = jax.jit(jax.vmap(
+    fit_beta_newton,
+    in_axes=(1, None, None, 0, 0, None, None),
+    out_axes=(0, 0, 0),
+), static_argnums=(5, 6))
 
 
 # =============================================================================
@@ -222,7 +209,7 @@ fit_beta_fisher_scoring_batch = jax.vmap(
 # =============================================================================
 
 
-@jax.jit
+@partial(jax.jit, static_argnums=(3, 4))
 def fit_beta_one_group(
     counts: jnp.ndarray,
     size_factors: jnp.ndarray,
@@ -255,7 +242,6 @@ def fit_beta_one_group(
         - converged: Whether converged.
     """
     dispersion = jnp.clip(dispersion, 1e-10, 1e10)
-    r = 1.0 / dispersion
 
     # Initialize with log of normalized mean
     norm_counts = counts / size_factors
@@ -302,90 +288,16 @@ def fit_beta_one_group(
 
 
 # Batched version
-fit_beta_one_group_batch = jax.vmap(
+fit_beta_one_group_batch = jax.jit(jax.vmap(
     fit_beta_one_group,
     in_axes=(1, None, 0, None, None),
     out_axes=(0, 0, 0),
-)
+), static_argnums=(3, 4))
 
 
 # =============================================================================
-# Dispersion estimation with frequency table optimization
+# Dispersion estimation
 # =============================================================================
-
-
-def _create_frequency_table(counts: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Create frequency table for count data.
-
-    Parameters
-    ----------
-    counts : jnp.ndarray
-        Count vector, shape (n_samples,).
-
-    Returns
-    -------
-    tuple[jnp.ndarray, jnp.ndarray]
-        - unique_counts: Unique count values.
-        - frequencies: Frequency of each unique count.
-    """
-    # This needs to be done in numpy as JAX doesn't support dynamic shapes
-    import numpy as np
-
-    counts_np = np.asarray(counts)
-    unique_counts, frequencies = np.unique(counts_np, return_counts=True)
-    return jnp.array(unique_counts), jnp.array(frequencies)
-
-
-@jax.jit
-def _nb_nll_frequency_table(
-    unique_counts: jnp.ndarray,
-    frequencies: jnp.ndarray,
-    mu: jnp.ndarray,
-    dispersion: float,
-) -> float:
-    """Compute NB negative log-likelihood using frequency table.
-
-    This is the key optimization from glmGamPoi - for sparse data with
-    many repeated values (especially zeros), we only compute expensive
-    special functions for unique values.
-
-    Parameters
-    ----------
-    unique_counts : jnp.ndarray
-        Unique count values.
-    frequencies : jnp.ndarray
-        Frequency of each unique count.
-    mu : jnp.ndarray
-        Mean estimates (full length, n_samples).
-    dispersion : float
-        Overdispersion parameter.
-
-    Returns
-    -------
-    float
-        Negative log-likelihood.
-    """
-    dispersion = jnp.clip(dispersion, 1e-10, 1e10)
-    r = 1.0 / dispersion
-
-    # For frequency table, we approximate mu as the mean
-    mu_mean = jnp.mean(mu)
-    mu_mean = jnp.clip(mu_mean, 1e-10, 1e50)
-
-    # Compute log-likelihood terms only for unique values
-    # ll = gammaln(y + r) - gammaln(y + 1) - gammaln(r) + r*log(r/(r+mu)) + y*log(mu/(r+mu))
-    ll_terms = (
-        gammaln(unique_counts + r)
-        - gammaln(unique_counts + 1)
-        - gammaln(r)
-        + r * jnp.log(r / (r + mu_mean))
-        + unique_counts * jnp.log(mu_mean / (r + mu_mean))
-    )
-
-    # Weight by frequencies
-    total_ll = jnp.sum(ll_terms * frequencies)
-
-    return -total_ll
 
 
 @jax.jit
@@ -445,15 +357,21 @@ def _cox_reid_adjustment(
     return 0.5 * logdet
 
 
-@partial(jax.jit, static_argnums=(4,))
-def estimate_dispersion_mle(
+@partial(jax.jit, static_argnums=(4, 5, 6))
+def estimate_dispersion_mle_newton(
     counts: jnp.ndarray,
     mu: jnp.ndarray,
     design: jnp.ndarray,
     init_dispersion: float,
     do_cox_reid: bool = True,
+    maxiter: int = 50,
+    tol: float = 1e-6,
 ) -> tuple[float, bool]:
-    """Estimate dispersion using MLE with optional Cox-Reid adjustment.
+    """Estimate dispersion using Newton's method on log-dispersion.
+
+    Fully JIT-able 1D Newton optimizer on the NLL w.r.t. log(dispersion),
+    using JAX autodiff for gradient and Hessian. Replaces the BFGS optimizer
+    for vmap compatibility.
 
     Parameters
     ----------
@@ -467,6 +385,10 @@ def estimate_dispersion_mle(
         Initial dispersion estimate.
     do_cox_reid : bool, default=True
         Whether to apply Cox-Reid adjustment.
+    maxiter : int, default=50
+        Maximum iterations.
+    tol : float, default=1e-6
+        Convergence tolerance on log-dispersion change.
 
     Returns
     -------
@@ -480,25 +402,83 @@ def estimate_dispersion_mle(
     def objective(log_disp):
         disp = jnp.exp(log_disp)
         nll = _nb_nll_full(counts, mu, disp)
+        cr = jnp.where(
+            do_cox_reid,
+            _cox_reid_adjustment(design, mu, disp),
+            0.0,
+        )
+        return nll + cr
 
-        if do_cox_reid:
-            cr_term = _cox_reid_adjustment(design, mu, disp)
-            nll = nll + cr_term
+    grad_fn = jax.grad(objective)
+    hess_fn = jax.grad(grad_fn)
 
-        return nll
+    def newton_body(state):
+        i, log_disp, converged = state
+        g = grad_fn(log_disp)
+        h = hess_fn(log_disp)
+        # Ensure positive curvature
+        h = jnp.maximum(h, 1e-6)
+        step = -g / h
+        # Clamp step size
+        step = jnp.clip(step, -2.0, 2.0)
 
-    # Use JAX's BFGS optimizer
-    result = jsp.optimize.minimize(
-        objective,
-        jnp.array([log_disp_init]),
-        method="BFGS",
-        options={"maxiter": 100},
+        # Simple backtracking: halve step if it increases the objective
+        log_disp_new = jnp.clip(log_disp + step, -23.0, 23.0)
+        obj_old = objective(log_disp)
+        obj_new = objective(log_disp_new)
+
+        # If no improvement, try half step, then quarter step
+        log_disp_half = jnp.clip(log_disp + step * 0.5, -23.0, 23.0)
+        obj_half = objective(log_disp_half)
+        log_disp_new = jnp.where(obj_half < obj_new, log_disp_half, log_disp_new)
+        obj_new = jnp.minimum(obj_half, obj_new)
+
+        log_disp_quarter = jnp.clip(log_disp + step * 0.25, -23.0, 23.0)
+        obj_quarter = objective(log_disp_quarter)
+        log_disp_new = jnp.where(obj_quarter < obj_new, log_disp_quarter, log_disp_new)
+
+        converged = jnp.abs(log_disp_new - log_disp) < tol
+        return (i + 1, log_disp_new, converged)
+
+    def newton_cond(state):
+        i, _, converged = state
+        return jnp.logical_and(i < maxiter, ~converged)
+
+    _, log_disp_final, converged = jax.lax.while_loop(
+        newton_cond, newton_body, (0, log_disp_init, False)
     )
 
-    dispersion = jnp.exp(result.x[0])
+    dispersion = jnp.exp(log_disp_final)
     dispersion = jnp.clip(dispersion, 1e-10, 1e10)
 
-    return dispersion, result.success
+    return dispersion, converged
+
+
+# Batched version: vmap across genes
+# counts: (n_samples, n_genes) -> axis 1
+# mu: (n_samples, n_genes) -> axis 1
+# design: shared -> None
+# init_dispersion: (n_genes,) -> axis 0
+estimate_dispersion_mle_batch = jax.jit(jax.vmap(
+    estimate_dispersion_mle_newton,
+    in_axes=(1, 1, None, 0, None, None, None),
+    out_axes=(0, 0),
+), static_argnums=(4, 5, 6))
+
+
+# Legacy BFGS wrapper (kept for single-gene use and backward compat)
+@partial(jax.jit, static_argnums=(4,))
+def estimate_dispersion_mle(
+    counts: jnp.ndarray,
+    mu: jnp.ndarray,
+    design: jnp.ndarray,
+    init_dispersion: float,
+    do_cox_reid: bool = True,
+) -> tuple[float, bool]:
+    """Estimate dispersion using MLE (BFGS, single-gene legacy interface)."""
+    return estimate_dispersion_mle_newton(
+        counts, mu, design, init_dispersion, do_cox_reid
+    )
 
 
 # =============================================================================
@@ -507,30 +487,24 @@ def estimate_dispersion_mle(
 
 
 @jax.jit
-def estimate_dispersion_moments(
+def _estimate_dispersion_moments_single(
     counts: jnp.ndarray,
     mu: jnp.ndarray,
 ) -> float:
-    """Estimate dispersion using method of moments.
-
-    Parameters
-    ----------
-    counts : jnp.ndarray
-        Observed counts, shape (n_samples,).
-    mu : jnp.ndarray
-        Fitted means, shape (n_samples,).
-
-    Returns
-    -------
-    float
-        Moment-based dispersion estimate.
-    """
-    # Var = mu + disp * mu^2
-    # disp = (Var - mu) / mu^2
+    """Estimate dispersion using method of moments (single gene)."""
     variance = jnp.var(counts, ddof=1)
     mean_mu = jnp.mean(mu)
-
     dispersion = (variance - mean_mu) / (mean_mu ** 2)
     dispersion = jnp.clip(dispersion, 1e-10, 1e10)
-
     return dispersion
+
+
+# Legacy alias
+estimate_dispersion_moments = _estimate_dispersion_moments_single
+
+# Batched: counts (n_samples, n_genes), mu (n_samples, n_genes)
+estimate_dispersion_moments_batch = jax.jit(jax.vmap(
+    _estimate_dispersion_moments_single,
+    in_axes=(1, 1),
+    out_axes=0,
+))

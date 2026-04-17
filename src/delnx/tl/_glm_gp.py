@@ -1,7 +1,8 @@
 """glmGamPoi-style differential expression analysis.
 
 This module provides the main interface for GPU-accelerated negative binomial
-differential expression analysis using the glmGamPoi approach.
+differential expression analysis using the glmGamPoi approach. Core solvers
+are vectorized with JAX vmap for batch-parallel processing across genes.
 
 References
 ----------
@@ -11,6 +12,7 @@ generalized linear models on single cell count data. Bioinformatics.
 
 from dataclasses import dataclass, field
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
@@ -23,10 +25,15 @@ from delnx._logging import logger
 from delnx._utils import _get_layer, _to_dense
 from delnx.models._glm_gp import (
     compute_gp_deviance,
+    compute_gp_deviance_batch,
     estimate_dispersion_mle,
+    estimate_dispersion_mle_batch,
     estimate_dispersion_moments,
+    estimate_dispersion_moments_batch,
     fit_beta_fisher_scoring,
+    fit_beta_newton_batch,
     fit_beta_one_group,
+    fit_beta_one_group_batch,
 )
 from delnx.models._quasi_likelihood import (
     compute_ql_dispersions,
@@ -62,6 +69,9 @@ class GLMGPResult:
         Design matrix used, shape (n_samples, n_coefficients).
     feature_names : pd.Index
         Feature/gene names.
+    counts : np.ndarray | None
+        Original count matrix, shape (n_samples, n_genes). Stored for
+        reduced-model refitting in test_de.
     condition_key : str | None
         Condition key used for design.
     ql_dispersions : np.ndarray | None
@@ -81,6 +91,7 @@ class GLMGPResult:
     deviances: np.ndarray
     design_matrix: np.ndarray
     feature_names: pd.Index
+    counts: np.ndarray | None = None
     condition_key: str | None = None
     ql_dispersions: np.ndarray | None = None
     df0_prior: float = 0.0
@@ -197,6 +208,22 @@ def glm_gp(
     design_jax = jnp.array(design_matrix)
     offset_jax = jnp.array(log_sf)
 
+    # Determine if intercept-only model
+    is_intercept_only = n_coef == 1
+
+    # Pre-compute QR decomposition for beta initialization
+    # (matching R's estimate_betas_roughly: OLS on log-normalized counts)
+    if not is_intercept_only:
+        Q_init, R_init = np.linalg.qr(design_matrix)
+        Q_init = Q_init[:, :n_coef]
+        R_init = R_init[:n_coef, :]
+
+    # Process genes in vectorized batches
+    n_batches = (n_genes + batch_size - 1) // batch_size
+
+    if verbose:
+        logger.info(f"Fitting {n_genes} genes with {n_coef} coefficient(s)", verbose=True)
+
     # Initialize storage
     Beta = np.zeros((n_genes, n_coef))
     dispersions = np.zeros(n_genes)
@@ -204,105 +231,81 @@ def glm_gp(
     converged = np.zeros(n_genes, dtype=bool)
     Mu = np.zeros((n_samples, n_genes))
 
-    # Determine if intercept-only model
-    is_intercept_only = n_coef == 1
-
-    # Process genes in batches
-    n_batches = (n_genes + batch_size - 1) // batch_size
-
-    if verbose:
-        logger.info(f"Fitting {n_genes} genes with {n_coef} coefficient(s)", verbose=True)
+    sf_jax = jnp.array(sf)
 
     for batch_idx in tqdm.tqdm(range(n_batches), disable=not verbose, desc="Fitting GLMs"):
         start = batch_idx * batch_size
         end = min(start + batch_size, n_genes)
-        batch_genes = range(start, end)
+        b = end - start  # batch width
 
-        # Get batch data
-        X_batch = _to_dense(X[:, start:end])
+        # Get batch data as dense JAX array (n_samples, b)
+        X_batch_np = _to_dense(X[:, start:end]).astype(np.float64)
+        X_batch = jnp.array(X_batch_np)
 
-        for i, gene_idx in enumerate(batch_genes):
-            counts = jnp.array(X_batch[:, i], dtype=jnp.float64)
+        # --- Step 1: Initial beta fit with moment-based dispersion ---
+        if is_intercept_only:
+            # Moment dispersion: broadcast sf across genes
+            mu_init = sf_jax[:, None] * jnp.mean(X_batch / sf_jax[:, None], axis=0, keepdims=True)
+            disp_init = estimate_dispersion_moments_batch(X_batch, mu_init)
+            disp_init = jnp.maximum(disp_init, 1e-8)
 
-            # Initial dispersion estimate (moments)
-            mu_init = sf * np.mean(X_batch[:, i] / sf)
-            disp_init = float(estimate_dispersion_moments(counts, jnp.array(mu_init)))
-            disp_init = max(disp_init, 1e-8)
+            # Batch fit intercept-only
+            beta0_arr, dev_arr, conv_arr = fit_beta_one_group_batch(
+                X_batch, sf_jax, disp_init, maxiter, 1e-8,
+            )
+            # Compute mu from intercept
+            mu_batch = sf_jax[:, None] * jnp.exp(beta0_arr[None, :])
+        else:
+            # Moment dispersion
+            mu_init = sf_jax[:, None] * jnp.mean(X_batch / sf_jax[:, None], axis=0, keepdims=True)
+            disp_init = estimate_dispersion_moments_batch(X_batch, mu_init)
+            disp_init = jnp.maximum(disp_init, 1e-8)
 
-            # Fit beta using Fisher-scoring
-            if is_intercept_only:
-                # Fast path for intercept-only
-                beta0, dev, conv = fit_beta_one_group(
-                    counts,
-                    jnp.array(sf),
-                    disp_init,
-                    maxiter=maxiter,
-                )
-                beta = np.array([float(beta0)])
-                mu = sf * np.exp(float(beta0))
-            else:
-                # Full Fisher-scoring
-                init_beta = jnp.zeros(n_coef)
-                # Better init for intercept
-                mean_norm = np.mean(X_batch[:, i] / sf)
-                init_beta = init_beta.at[0].set(np.log(max(mean_norm, 1e-10)))
+            # OLS initialization for all genes in batch
+            log_norm = np.log(X_batch_np / sf[:, None] + 1.0)  # (n_samples, b)
+            init_betas = np.linalg.solve(R_init, Q_init.T @ log_norm)  # (n_coef, b)
+            init_betas_jax = jnp.array(init_betas.T)  # (b, n_coef)
 
-                beta, dev, conv = fit_beta_fisher_scoring(
-                    counts,
-                    design_jax,
-                    offset_jax,
-                    disp_init,
-                    init_beta,
-                    maxiter=maxiter,
-                )
-                beta = np.array(beta)
-                eta = design_matrix @ beta + log_sf
-                mu = np.exp(np.clip(eta, -50, 50))
+            # Batch Newton-Raphson fit
+            beta_arr, dev_arr, conv_arr = fit_beta_newton_batch(
+                X_batch, design_jax, offset_jax, disp_init, init_betas_jax,
+                maxiter, 1e-8,
+            )
+            # Compute mu
+            # beta_arr: (b, n_coef), design_jax: (n_samples, n_coef)
+            eta_batch = design_jax @ beta_arr.T + offset_jax[:, None]  # (n_samples, b)
+            mu_batch = jnp.exp(jnp.clip(eta_batch, -50, 50))
 
-            # Estimate dispersion MLE
-            if overdispersion:
-                disp, _ = estimate_dispersion_mle(
-                    counts,
-                    jnp.array(mu),
-                    design_jax,
-                    disp_init,
-                    do_cox_reid=do_cox_reid_adjustment,
-                )
-                disp = float(disp)
-            else:
-                disp = 1e-10  # Effectively Poisson
+        # --- Step 2: Dispersion MLE ---
+        if overdispersion:
+            disp_arr, _ = estimate_dispersion_mle_batch(
+                X_batch, mu_batch, design_jax, disp_init,
+                do_cox_reid_adjustment, 50, 1e-6,
+            )
+        else:
+            disp_arr = jnp.full(b, 1e-10)
 
-            # Refit with final dispersion
-            if is_intercept_only:
-                beta0, dev, conv = fit_beta_one_group(
-                    counts,
-                    jnp.array(sf),
-                    disp,
-                    maxiter=maxiter,
-                )
-                beta = np.array([float(beta0)])
-                mu = sf * np.exp(float(beta0))
-                dev = float(dev)
-            else:
-                beta, dev, conv = fit_beta_fisher_scoring(
-                    counts,
-                    design_jax,
-                    offset_jax,
-                    disp,
-                    jnp.array(beta),
-                    maxiter=maxiter,
-                )
-                beta = np.array(beta)
-                eta = design_matrix @ beta + log_sf
-                mu = np.exp(np.clip(eta, -50, 50))
-                dev = float(dev)
+        # --- Step 3: Refit beta with final dispersion ---
+        if is_intercept_only:
+            beta0_arr, dev_arr, conv_arr = fit_beta_one_group_batch(
+                X_batch, sf_jax, disp_arr, maxiter, 1e-8,
+            )
+            mu_batch = sf_jax[:, None] * jnp.exp(beta0_arr[None, :])
+            Beta[start:end, 0] = np.asarray(beta0_arr)
+        else:
+            beta_arr, dev_arr, conv_arr = fit_beta_newton_batch(
+                X_batch, design_jax, offset_jax, disp_arr, beta_arr,
+                maxiter, 1e-8,
+            )
+            eta_batch = design_jax @ beta_arr.T + offset_jax[:, None]
+            mu_batch = jnp.exp(jnp.clip(eta_batch, -50, 50))
+            Beta[start:end] = np.asarray(beta_arr)
 
-            # Store results
-            Beta[gene_idx] = beta
-            dispersions[gene_idx] = disp
-            deviances[gene_idx] = dev
-            converged[gene_idx] = bool(conv)
-            Mu[:, gene_idx] = mu
+        # Store results
+        dispersions[start:end] = np.asarray(disp_arr)
+        deviances[start:end] = np.asarray(dev_arr)
+        converged[start:end] = np.asarray(conv_arr)
+        Mu[:, start:end] = np.asarray(mu_batch)
 
     # Apply quasi-likelihood shrinkage if requested
     ql_dispersions = None
@@ -321,6 +324,14 @@ def glm_gp(
             dispersions, mean_expression, method="local_median"
         )
 
+        # Recompute deviances using trend dispersion (vectorized)
+        counts_dense_jax = jnp.array(_to_dense(X).astype(np.float64))
+        Mu_jax = jnp.array(Mu)
+        disp_trend_jax = jnp.array(dispersion_trend)
+        deviances = np.asarray(compute_gp_deviance_batch(
+            counts_dense_jax, Mu_jax, disp_trend_jax
+        ))
+
         # Transform to QL scale
         ql_dispersions = compute_ql_dispersions(
             dispersions, mean_expression, dispersion_trend
@@ -332,6 +343,9 @@ def glm_gp(
             ql_dispersions, df_residual
         )
 
+    # Store dense count matrix for reduced-model refitting in test_de
+    counts_dense = _to_dense(X)
+
     return GLMGPResult(
         Beta=Beta,
         overdispersions=dispersions,
@@ -340,6 +354,7 @@ def glm_gp(
         deviances=deviances,
         design_matrix=design_matrix,
         feature_names=adata.var_names,
+        counts=counts_dense,
         condition_key=condition_key,
         ql_dispersions=ql_dispersions,
         df0_prior=df0_prior,
@@ -424,52 +439,71 @@ def test_de(
     # Get coefficients for tested term
     coefs = fit.Beta[:, test_idx]
 
-    # Log2 fold change (coefficient is on log scale)
-    log2fc = coefs / np.log(2)
+    # Log2 fold change (coefficient is on log scale), capped at ±10
+    log2fc = np.clip(coefs / np.log(2), -10.0, 10.0)
 
-    # Create reduced design by dropping tested column
+    # Build reduced design by dropping tested column
     if reduced_design is None:
         keep_cols = [i for i in range(n_coef) if i != test_idx]
         reduced_design = fit.design_matrix[:, keep_cols]
 
-    # Compute deviance for reduced model
-    # We need to refit with reduced design to get proper deviances
-    # For now, use the approximation based on coefficient significance
+    # Likelihood ratio test: refit reduced model and compare deviances.
+    # This matches R's glmGamPoi::test_de approach.
+    reduced_jax = jnp.array(reduced_design)
+    offset_jax = jnp.array(np.log(np.maximum(fit.size_factors, 1e-10)))
+    n_coef_reduced = reduced_design.shape[1]
 
-    # Use QL F-test if available, otherwise Wald test
+    if fit.counts is None:
+        raise ValueError(
+            "Count matrix not stored in GLMGPResult. "
+            "Re-run glm_gp to obtain a fit with stored counts."
+        )
+
+    # Use dispersion trend if available (matching R), else MLE
+    disp_vec = (
+        jnp.array(fit.dispersion_trend)
+        if fit.dispersion_trend is not None
+        else jnp.array(fit.overdispersions)
+    )
+
+    counts_jax = jnp.array(fit.counts.astype(np.float64))
+    sf_jax = jnp.array(fit.size_factors)
+
+    # Batch refit reduced model
+    if n_coef_reduced == 1:
+        # Intercept-only reduced model — use vmapped fast path
+        _, deviances_reduced_jax, _ = fit_beta_one_group_batch(
+            counts_jax, sf_jax, disp_vec, 100, 1e-8,
+        )
+        deviances_reduced = np.asarray(deviances_reduced_jax)
+    else:
+        # Multi-coef reduced model — batch Newton-Raphson
+        init_betas_r = jnp.zeros((n_genes, n_coef_reduced))
+        # Initialize intercept from full model
+        init_betas_r = init_betas_r.at[:, 0].set(jnp.array(fit.Beta[:, 0]))
+        _, deviances_reduced_jax, _ = fit_beta_newton_batch(
+            counts_jax, reduced_jax, offset_jax, disp_vec, init_betas_r,
+            100, 1e-8,
+        )
+        deviances_reduced = np.asarray(deviances_reduced_jax)
+
+    # F-statistic from deviance difference
+    df_full = n_samples - n_coef
+    df_test = n_coef - n_coef_reduced  # typically 1
+
+    dev_diff = np.maximum(deviances_reduced - fit.deviances, 0.0)
+
     if fit.ql_dispersions is not None:
         # Quasi-likelihood F-test
-        # Approximate by comparing full vs reduced deviance
-        # For a single coefficient test, the deviance difference is approximately
-        # chi2 with 1 df, so F ~ chi2/1
-
-        # Wald-like approximation for F-statistic
-        # F = coef^2 / (var(coef) * ql_disp)
-        # Using deviance-based approximation
-        df_full = n_samples - n_coef
-        df_reduced = n_samples - (n_coef - 1)
-
-        # Approximate deviance difference using coefficient
-        # This is a simplification; full implementation would refit
-        dev_diff = coefs ** 2 * df_full / np.maximum(fit.ql_dispersions, 1e-10)
-
-        f_stats, pvals = ql_f_test(
-            fit.deviances,
-            fit.deviances + dev_diff,
-            df_full=df_full,
-            df_reduced=df_reduced,
-            ql_dispersions=fit.ql_dispersions,
-            df0_prior=fit.df0_prior,
-        )
-    else:
-        # Fall back to Wald-like test
-        # z = coef / se, p-value from normal
-        # Approximate SE from deviance
-        se_approx = np.sqrt(fit.deviances / (n_samples - n_coef))
-        z_stats = coefs / np.maximum(se_approx, 1e-10)
-        f_stats = z_stats ** 2
+        f_stats = dev_diff / (df_test * np.maximum(fit.ql_dispersions, 1e-10))
+        df_denom = df_full + fit.df0_prior
         from scipy import stats
-        pvals = stats.chi2.sf(f_stats, df=1)
+        pvals = stats.f.sf(f_stats, df_test, df_denom)
+    else:
+        # Without QL shrinkage, use chi-squared approximation
+        f_stats = dev_diff / df_test
+        from scipy import stats
+        pvals = stats.chi2.sf(f_stats, df=df_test)
 
     # Multiple testing correction
     valid_pvals = np.isfinite(pvals)
