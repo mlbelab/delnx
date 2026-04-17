@@ -912,14 +912,5 @@ class TestNbFormula:
 class TestDeprecatedAliases:
     """Tests for deprecated aliases."""
 
-    def test_aliases_resolve(self):
-        """Test that old names still work."""
-        import delnx as dx
-
-        assert dx.tl.glm_gp is dx.tl.nb_fit
-        assert dx.tl.glm_gp_test is dx.tl.nb_test
-        assert dx.tl.GLMGPResult is dx.tl.NBFitResult
-
-
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

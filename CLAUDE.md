@@ -35,10 +35,10 @@ The package lives in `src/delnx/` and follows a scanpy-style modular API: `impor
 
 ### Submodules
 
-- **`pp`** (preprocessing): pseudobulk aggregation, size factor estimation, dispersion estimation, AUCell scoring
+- **`pp`** (preprocessing): pseudobulk aggregation, size factor estimation, AUCell scoring
 - **`tl`** (tools): `de()` for general-purpose DE (LR, ANOVA, binomial), `nb_fit()`/`nb_test()` for negative binomial GLMs, `rank_de()` for fast AUROC markers, `grouped()` for per-group DE, `log2fc()`/`auroc()` for effect sizes, `build_design()` for formula-based design matrices
 - **`pl`** (plotting): volcano, heatmap, dot, matrix, and violin plots (built on marsilea). All plot classes inherit from `_baseplot.BasePlot`
-- **`models`**: JAX-based regression models (`NegativeBinomialRegression`, `LogisticRegression`, `LinearRegression`, `DispersionEstimator`) and glmGamPoi core solvers (`_glm_gp.py`, `_quasi_likelihood.py`)
+- **`models`**: JAX-based regression models (`NegativeBinomialRegression`, `LogisticRegression`, `LinearRegression`) and glmGamPoi core solvers (`_glm_gp.py`, `_quasi_likelihood.py`)
 - **`ds`** (datasets): synthetic data generation, GMT gene set loading
 
 ### Key Data Flow

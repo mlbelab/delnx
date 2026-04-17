@@ -11,7 +11,6 @@ Preprocessing
 
     pseudobulk
     size_factors
-    dispersion
 
 
 Differential Expression
@@ -50,7 +49,7 @@ Utilities
     :toctree: genapi
 
     build_design
-    single_enrichment_analysis
+    gsea
 
 
 Models
@@ -64,7 +63,6 @@ Models
     LinearRegression
     LogisticRegression
     NegativeBinomialRegression
-    DispersionEstimator
 
 
 Plotting
@@ -76,8 +74,6 @@ Plotting
     :toctree: genapi
 
     dotplot
-    gsea_dotplot
-    gsea_heatmap
     heatmap
     matrixplot
     violinplot
