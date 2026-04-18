@@ -82,6 +82,9 @@ urls.Documentation = "https://delnx.readthedocs.io/"
 urls.Homepage = "https://github.com/joschif/delnx"
 urls.Source = "https://github.com/joschif/delnx"
 
+[tool.hatch.build.targets.sdist]
+exclude = [ "docs/notebooks/data" ]
+
 [tool.hatch.envs.default]
 installer = "uv"
 features = [ "dev", "test" ]
