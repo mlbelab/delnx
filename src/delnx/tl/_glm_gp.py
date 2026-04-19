@@ -258,11 +258,20 @@ def nb_fit(
         Q_init = Q_init[:, :n_coef]
         R_init = R_init[:n_coef, :]
 
-    # Process genes in vectorized batches
+    # Auto-tune batch size to fit GPU memory.
+    # Peak memory per gene in Newton-Raphson: ~n_samples * n_coef * 8 * 10 bytes
+    # (Hessian, score, W, delta, mu — multiple intermediates alive during backprop).
+    # Target: keep batch below ~4 GB to leave room for JAX overhead.
+    if not is_intercept_only and n_coef > 10:
+        mem_per_gene = n_samples * n_coef * 8 * 10
+        max_batch = max(16, int(4e9 / mem_per_gene))
+        if max_batch < batch_size:
+            batch_size = max_batch
+
     n_batches = (n_genes + batch_size - 1) // batch_size
 
     if verbose:
-        logger.info(f"Fitting {n_genes} genes with {n_coef} coefficient(s)", verbose=True)
+        logger.info(f"Fitting {n_genes} genes with {n_coef} coefficient(s) (batch_size={batch_size})", verbose=True)
 
     # Initialize storage
     all_beta = np.zeros((n_genes, n_coef))
@@ -364,13 +373,16 @@ def nb_fit(
             dispersions, mean_expression, method="local_median"
         )
 
-        # Recompute deviances using trend dispersion (vectorized)
-        counts_dense_jax = jnp.array(_to_dense(X).astype(np.float64))
-        mu_jax = jnp.array(all_mu)
+        # Recompute deviances using trend dispersion (batched)
         disp_trend_jax = jnp.array(dispersion_trend)
-        deviances = np.asarray(compute_gp_deviance_batch(
-            counts_dense_jax, mu_jax, disp_trend_jax
-        ))
+        for batch_start in range(0, n_genes, batch_size):
+            batch_end = min(batch_start + batch_size, n_genes)
+            counts_batch = jnp.array(_to_dense(X[:, batch_start:batch_end]).astype(np.float64))
+            mu_batch = jnp.array(all_mu[:, batch_start:batch_end])
+            disp_batch = disp_trend_jax[batch_start:batch_end]
+            deviances[batch_start:batch_end] = np.asarray(
+                compute_gp_deviance_batch(counts_batch, mu_batch, disp_batch)
+            )
 
         # Transform to QL scale
         ql_dispersions = compute_ql_dispersions(
@@ -413,6 +425,7 @@ def nb_test(
     reduced_design: np.ndarray | None = None,
     multitest_method: str = "fdr_bh",
     lfc_threshold: float = 0.0,
+    batch_size: int = 512,
 ) -> pd.DataFrame:
     """Test for differential expression using quasi-likelihood F-test.
 
@@ -436,6 +449,9 @@ def nb_test(
         Method for multiple testing correction.
     lfc_threshold : float, default=0.0
         Threshold for log2 fold change filtering.
+    batch_size : int, default=512
+        Number of genes to process in each batch. Controls GPU memory usage
+        for the reduced model refit.
 
     Returns
     -------
@@ -504,26 +520,36 @@ def nb_test(
 
     # Get counts from adata (not stored on fit)
     X = _get_layer(adata, fit.layer)
-    counts_jax = jnp.array(_to_dense(X).astype(np.float64))
     sf_jax = jnp.array(fit.size_factors)
 
-    # Batch refit reduced model
-    if n_coef_reduced == 1:
-        # Intercept-only reduced model — use vmapped fast path
-        _, deviances_reduced_jax, _ = fit_beta_one_group_batch(
-            counts_jax, sf_jax, disp_vec, 100, 1e-8,
-        )
-        deviances_reduced = np.asarray(deviances_reduced_jax)
-    else:
-        # Multi-coef reduced model — batch Newton-Raphson
-        init_betas_r = jnp.zeros((n_genes, n_coef_reduced))
-        # Initialize intercept from full model
-        init_betas_r = init_betas_r.at[:, 0].set(jnp.array(fit.beta[:, 0]))
-        _, deviances_reduced_jax, _ = fit_beta_newton_batch(
-            counts_jax, reduced_jax, offset_jax, disp_vec, init_betas_r,
-            100, 1e-8,
-        )
-        deviances_reduced = np.asarray(deviances_reduced_jax)
+    # Auto-tune batch size for reduced model refit
+    if n_coef_reduced > 10:
+        mem_per_gene = n_samples * n_coef_reduced * 8 * 10
+        max_batch = max(16, int(4e9 / mem_per_gene))
+        if max_batch < batch_size:
+            batch_size = max_batch
+
+    # Refit reduced model in gene batches to control GPU memory
+    deviances_reduced = np.zeros(n_genes)
+
+    for start in range(0, n_genes, batch_size):
+        end = min(start + batch_size, n_genes)
+        counts_batch = jnp.array(_to_dense(X[:, start:end]).astype(np.float64))
+        disp_batch = disp_vec[start:end]
+
+        if n_coef_reduced == 1:
+            _, dev_batch, _ = fit_beta_one_group_batch(
+                counts_batch, sf_jax, disp_batch, 100, 1e-8,
+            )
+        else:
+            init_batch = jnp.zeros((end - start, n_coef_reduced))
+            init_batch = init_batch.at[:, 0].set(jnp.array(fit.beta[start:end, 0]))
+            _, dev_batch, _ = fit_beta_newton_batch(
+                counts_batch, reduced_jax, offset_jax, disp_batch, init_batch,
+                100, 1e-8,
+            )
+
+        deviances_reduced[start:end] = np.asarray(dev_batch)
 
     # F-statistic from deviance difference
     df_full = n_samples - n_coef
@@ -676,6 +702,7 @@ def nb_de(
         contrast=contrast,
         multitest_method=multitest_method,
         lfc_threshold=lfc_threshold,
+        batch_size=batch_size,
     )
 
 
