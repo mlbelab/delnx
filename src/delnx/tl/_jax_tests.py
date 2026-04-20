@@ -60,38 +60,41 @@ def _run_lr_test(
 
 @jax.jit
 def _anova_precompute(covars):
-    """Precompute null-model projection matrix (shared across all genes).
+    """Precompute null-model QR factor (shared across all genes).
 
-    Returns the residual-maker M_null = I - H_null where H_null is the
-    hat matrix of the covariate (null) model.
+    Returns Q from QR decomposition of covars. The residual projection
+    M_null @ v = v - Q @ (Q.T @ v) is applied implicitly to avoid
+    materializing the (n_samples, n_samples) matrix M_null.
     """
-    # QR is numerically stable for computing projections
     Q, _ = jnp.linalg.qr(covars)
-    # M_null = I - Q @ Q^T (residual maker)
-    M_null = jnp.eye(covars.shape[0]) - Q @ Q.T
-    return M_null
+    return Q
+
+
+def _project_residual(Q, v):
+    """Apply null-model residual projection: v - Q @ (Q.T @ v)."""
+    return v - Q @ (Q.T @ v)
 
 
 @jax.jit
-def _anova_ftest_single(x, y, M_null, n, p_null):
+def _anova_ftest_single(x, y, Q, n, p_null):
     """Closed-form ANOVA F-test for a single feature.
 
     Tests whether adding feature x to the null model (covars only)
     significantly improves fit. Uses the Frisch-Waugh-Lovell theorem:
     the coefficient and SS reduction from adding x equal those from
-    regressing M_null @ y on M_null @ x.
+    regressing the null-residualized y on the null-residualized x.
 
     Parameters
     ----------
     x : feature values (n_samples,)
     y : response (n_samples,)
-    M_null : null-model residual maker (n_samples, n_samples)
+    Q : QR factor of null model covariates (n_samples, p_null)
     n : number of samples
     p_null : number of null-model columns
     """
-    # Project out null-model covariates
-    x_resid = M_null @ x      # (n,)
-    y_resid = M_null @ y      # (n,)
+    # Project out null-model covariates (implicit residual maker)
+    x_resid = _project_residual(Q, x)  # (n,)
+    y_resid = _project_residual(Q, y)  # (n,)
 
     # OLS of y_resid on x_resid (scalar regression)
     xrxr = jnp.dot(x_resid, x_resid)
@@ -119,13 +122,13 @@ _anova_ftest_batch = jax.vmap(
 
 
 @jax.jit
-def _residual_ftest_single(x, y, M_null, n, p_null):
+def _residual_ftest_single(x, y, Q, n, p_null):
     """Closed-form residual F-test for a single feature.
 
     Compares residual variance of null vs full model.
     """
-    x_resid = M_null @ x
-    y_resid = M_null @ y
+    x_resid = _project_residual(Q, x)
+    y_resid = _project_residual(Q, y)
 
     xrxr = jnp.dot(x_resid, x_resid)
     xryr = jnp.dot(x_resid, y_resid)
@@ -168,14 +171,14 @@ def _run_anova_test(
     n = X.shape[0]
     p_null = covars.shape[1]
 
-    # Precompute null-model projection (shared across all genes)
-    M_null = _anova_precompute(covars)
+    # Precompute null-model QR factor (shared across all genes)
+    Q = _anova_precompute(covars)
 
     if method == "anova":
-        coefs, f_stat, df_full = _anova_ftest_batch(X, cond, M_null, n, p_null)
+        coefs, f_stat, df_full = _anova_ftest_batch(X, cond, Q, n, p_null)
         pvals = stats.f.sf(np.asarray(f_stat), 1, int(df_full))
     else:  # residual
-        coefs, f_stat, df_null, df_full = _residual_ftest_batch(X, cond, M_null, n, p_null)
+        coefs, f_stat, df_null, df_full = _residual_ftest_batch(X, cond, Q, n, p_null)
         p_resid_cdf = stats.f.cdf(np.asarray(f_stat), int(df_null), int(df_full))
         pvals = 1 - np.abs(0.5 - p_resid_cdf) * 2
 
