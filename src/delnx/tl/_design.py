@@ -137,9 +137,17 @@ def resolve_contrast(
         return column_names.index(contrast)
 
     # 2. Bracket shorthand: "key[level]" → "key[T.level]"
-    m = _BRACKET_RE.match(contrast)
-    if m:
-        candidate = f"{m.group(1)}[T.{m.group(2)}]"
+    #    Also handles interaction terms: "a[x]:b[y]" → "a[T.x]:b[T.y]"
+    if "[" in contrast:
+        segments = contrast.split(":")
+        resolved = []
+        for seg in segments:
+            m = _BRACKET_RE.match(seg)
+            if m and not m.group(2).startswith("T."):
+                resolved.append(f"{m.group(1)}[T.{m.group(2)}]")
+            else:
+                resolved.append(seg)
+        candidate = ":".join(resolved)
         if candidate in column_names:
             return column_names.index(candidate)
 
