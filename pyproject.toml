@@ -4,7 +4,7 @@ requires = [ "hatchling" ]
 
 [project]
 name = "delnx"
-version = "0.2.3"
+version = "0.3.0"
 description = "Differential expression analysis for single-cell genomics"
 readme = "README.md"
 license = { file = "LICENSE" }
