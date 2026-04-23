@@ -111,6 +111,130 @@ def test_validate_conditions(conditions):
         _validate_conditions(conditions, reference=None, mode="1_vs_1")
 
 
+class TestResolveContrast:
+    """Tests for resolve_contrast() shorthand resolution."""
+
+    COLUMNS = ["Intercept", "treatment[T.drugA]", "treatment[T.drugB]", "batch[T.b2]"]
+
+    def test_exact_match(self):
+        from delnx.tl._design import resolve_contrast
+
+        assert resolve_contrast("treatment[T.drugA]", self.COLUMNS) == 1
+
+    def test_none_returns_last(self):
+        from delnx.tl._design import resolve_contrast
+
+        assert resolve_contrast(None, self.COLUMNS) == 3
+
+    def test_int_passthrough(self):
+        from delnx.tl._design import resolve_contrast
+
+        assert resolve_contrast(2, self.COLUMNS) == 2
+
+    def test_bracket_shorthand(self):
+        from delnx.tl._design import resolve_contrast
+
+        assert resolve_contrast("treatment[drugA]", self.COLUMNS) == 1
+
+    def test_bare_level_with_condition_key(self):
+        from delnx.tl._design import resolve_contrast
+
+        assert resolve_contrast("drugA", self.COLUMNS, condition_key="treatment") == 1
+
+    def test_bare_level_suffix_scan(self):
+        from delnx.tl._design import resolve_contrast
+
+        assert resolve_contrast("b2", self.COLUMNS) == 3
+
+    def test_ambiguous_bare_level(self):
+        from delnx.tl._design import resolve_contrast
+
+        cols = ["Intercept", "x[T.A]", "y[T.A]"]
+        with pytest.raises(ValueError, match="ambiguous"):
+            resolve_contrast("A", cols)
+
+    def test_not_found(self):
+        from delnx.tl._design import resolve_contrast
+
+        with pytest.raises(ValueError, match="not found"):
+            resolve_contrast("nonexistent", self.COLUMNS)
+
+    def test_interaction_bracket_shorthand(self):
+        from delnx.tl._design import resolve_contrast
+
+        cols = ["Intercept", "a[T.x]", "b[T.y]", "a[T.x]:b[T.y]"]
+        assert resolve_contrast("a[x]:b[y]", cols) == 3
+
+    def test_interaction_mixed_shorthand(self):
+        from delnx.tl._design import resolve_contrast
+
+        cols = ["Intercept", "a[T.x]", "b[T.y]", "a[T.x]:b[T.y]"]
+        assert resolve_contrast("a[x]:b[T.y]", cols) == 3
+
+
+class TestParseContrastVector:
+    """Tests for parse_contrast_vector() formula parsing."""
+
+    COLUMNS = ["Intercept", "treatment[T.drugA]", "treatment[T.drugB]"]
+
+    def test_list_input(self):
+        from delnx.tl._design import parse_contrast_vector
+
+        vec = parse_contrast_vector([0, 1, -1], self.COLUMNS)
+        np.testing.assert_array_equal(vec, [0, 1, -1])
+
+    def test_array_input(self):
+        from delnx.tl._design import parse_contrast_vector
+
+        vec = parse_contrast_vector(np.array([0, 1, -1]), self.COLUMNS)
+        np.testing.assert_array_equal(vec, [0, 1, -1])
+
+    def test_wrong_length(self):
+        from delnx.tl._design import parse_contrast_vector
+
+        with pytest.raises(ValueError, match="length"):
+            parse_contrast_vector([0, 1], self.COLUMNS)
+
+    def test_string_formula_subtraction(self):
+        from delnx.tl._design import parse_contrast_vector
+
+        vec = parse_contrast_vector("drugA - drugB", self.COLUMNS, condition_key="treatment")
+        np.testing.assert_array_equal(vec, [0, 1, -1])
+
+    def test_string_formula_addition(self):
+        from delnx.tl._design import parse_contrast_vector
+
+        vec = parse_contrast_vector("drugA + drugB", self.COLUMNS, condition_key="treatment")
+        np.testing.assert_array_equal(vec, [0, 1, 1])
+
+    def test_string_formula_with_coefficient(self):
+        from delnx.tl._design import parse_contrast_vector
+
+        vec = parse_contrast_vector("0.5*drugA + 0.5*drugB", self.COLUMNS, condition_key="treatment")
+        np.testing.assert_array_equal(vec, [0, 0.5, 0.5])
+
+    def test_single_term_returns_none(self):
+        from delnx.tl._design import parse_contrast_vector
+
+        assert parse_contrast_vector("drugA", self.COLUMNS) is None
+
+    def test_none_returns_none(self):
+        from delnx.tl._design import parse_contrast_vector
+
+        assert parse_contrast_vector(None, self.COLUMNS) is None
+
+    def test_int_returns_none(self):
+        from delnx.tl._design import parse_contrast_vector
+
+        assert parse_contrast_vector(1, self.COLUMNS) is None
+
+    def test_bracket_shorthand_in_formula(self):
+        from delnx.tl._design import parse_contrast_vector
+
+        vec = parse_contrast_vector("treatment[drugA] - treatment[drugB]", self.COLUMNS)
+        np.testing.assert_array_equal(vec, [0, 1, -1])
+
+
 def test_log2fc_adata(adata_small):
     """Test log2 fold change calculation on AnnData object."""
     import delnx

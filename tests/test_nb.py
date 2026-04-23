@@ -1,5 +1,6 @@
 """Tests for negative binomial DE models."""
 
+import anndata as ad
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
@@ -907,6 +908,64 @@ class TestNbFormula:
         assert fit.beta.shape[1] == 2
         results = nb_test(adata_with_batch, fit, contrast="drugA")
         assert len(results) == adata_with_batch.n_vars
+
+
+class TestWaldContrast:
+    """Tests for custom contrast vectors via Wald test."""
+
+    @pytest.fixture
+    def three_group_fit(self):
+        rng = np.random.default_rng(42)
+        counts = rng.negative_binomial(5, 0.3, (90, 30)).astype(np.float64)
+        counts[:30, :5] *= 3
+        adata = ad.AnnData(X=counts)
+        adata.var_names = [f"g{i}" for i in range(30)]
+        adata.obs["treatment"] = ["ctrl"] * 30 + ["drugA"] * 30 + ["drugB"] * 30
+        from delnx.tl import nb_fit
+        fit = nb_fit(adata, condition_key="treatment", reference="ctrl", verbose=False)
+        return adata, fit
+
+    def test_numeric_vector_matches_single_column(self, three_group_fit):
+        """contrast=[0, 1, 0] should match contrast='drugA'."""
+        from delnx.tl import nb_test
+        adata, fit = three_group_fit
+        r_lrt = nb_test(adata, fit, contrast="drugA")
+        r_wald = nb_test(adata, fit, contrast=[0, 1, 0])
+        # LFC should be identical (same c'β)
+        np.testing.assert_array_almost_equal(
+            r_lrt.set_index("feature")["log2fc"],
+            r_wald.set_index("feature")["log2fc"],
+        )
+
+    def test_string_formula_drugA_minus_drugB(self, three_group_fit):
+        """contrast='drugA - drugB' should match refitting with reference='drugB'."""
+        from delnx.tl import nb_fit, nb_test
+        adata, fit = three_group_fit
+        r_wald = nb_test(adata, fit, contrast="drugA - drugB")
+        # Refit with drugB as reference
+        fit_b = nb_fit(adata, condition_key="treatment", reference="drugB", verbose=False)
+        r_refit = nb_test(adata, fit_b, contrast="drugA")
+        # LFC should match exactly
+        lfc_wald = r_wald.set_index("feature")["log2fc"]
+        lfc_refit = r_refit.set_index("feature")["log2fc"]
+        from scipy.stats import pearsonr
+        r, _ = pearsonr(lfc_wald, lfc_refit[lfc_wald.index])
+        assert r > 0.999, f"LFC correlation {r} too low"
+
+    def test_average_contrast(self, three_group_fit):
+        """contrast='0.5*drugA + 0.5*drugB' should return average effect."""
+        from delnx.tl import nb_test
+        adata, fit = three_group_fit
+        r = nb_test(adata, fit, contrast=[0, 0.5, 0.5])
+        assert len(r) == 30
+        assert "log2fc" in r.columns
+
+    def test_wrong_vector_length(self, three_group_fit):
+        """Wrong-length vector should raise."""
+        from delnx.tl import nb_test
+        adata, fit = three_group_fit
+        with pytest.raises(ValueError, match="length"):
+            nb_test(adata, fit, contrast=[0, 1])
 
 
 class TestDeprecatedAliases:
