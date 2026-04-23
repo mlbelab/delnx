@@ -1,4 +1,4 @@
-🌳 delnx
+🌸 delnx
 =========
 
 .. image:: https://img.shields.io/pypi/v/delnx.svg?color=blue

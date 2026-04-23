@@ -73,7 +73,7 @@ intersphinx_mapping = {
     "optax": ("https://optax.readthedocs.io/en/latest/", None),
 }
 master_doc = "index"
-pygments_style = "solarized-light"
+pygments_style = "xcode"
 pygments_dark_style = "lightbulb"
 
 autosummary_generate = True
@@ -134,10 +134,10 @@ html_show_sourcelink = False
 html_theme_options = {
     "sidebar_hide_name": True,
     "light_logo": "images/delnx.png",
-    "dark_logo": "images/delnx_dark.png",
+    "dark_logo": "images/delnx.png",
     "light_css_variables": {
-        "color-brand-primary": "#003262",
-        "color-brand-content": "#003262",
+        "color-brand-primary": "#5B2D5E",
+        "color-brand-content": "#5B2D5E",
         "admonition-font-size": "var(--font-size-normal)",
         "admonition-title-font-size": "var(--font-size-normal)",
         "code-font-size": "var(--font-size--small)",
