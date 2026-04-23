@@ -134,7 +134,7 @@ html_show_sourcelink = False
 html_theme_options = {
     "sidebar_hide_name": True,
     "light_logo": "images/delnx.png",
-    "dark_logo": "images/delnx_dark.png",
+    "dark_logo": "images/delnx.png",
     "light_css_variables": {
         "color-brand-primary": "#003262",
         "color-brand-content": "#003262",
