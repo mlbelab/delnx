@@ -16,7 +16,7 @@ from delnx._logging import logger
 from delnx._utils import _get_layer
 
 from ._de_tests import _run_de
-from ._design import build_design
+from ._design import build_design, resolve_contrast
 from ._jax_tests import _run_batched_de
 from ._utils import _check_method_and_data_type, _infer_data_type
 
@@ -57,9 +57,12 @@ def de(
         R-style formula for the design matrix (e.g., ``"~ treatment + batch"``).
         Parsed by patsy. Mutually exclusive with ``condition_key``.
     contrast : str | int | None, default=None
-        Coefficient to test. Can be a design column name
-        (e.g., ``"treatment[T.drugA]"``) or an integer index.
-        If None, the last coefficient is tested.
+        Coefficient to test. Supports shorthand:
+
+        - Level name: ``"drugA"`` (resolved via ``condition_key``).
+        - Bracket shorthand: ``"treatment[drugA]"`` (for multi-covariate formulas).
+        - Full patsy name: ``"treatment[T.drugA]"`` (always works).
+        - Integer index or None (last coefficient).
     reference : str | None, default=None
         Reference level for categorical conditions. This level becomes
         the intercept in treatment coding.
@@ -163,19 +166,7 @@ def de(
     )
 
     # Resolve contrast to column index
-    if contrast is None:
-        test_idx = design_matrix.shape[1] - 1  # Last coefficient
-    elif isinstance(contrast, str):
-        if contrast not in column_names:
-            raise ValueError(
-                f"Contrast '{contrast}' not found in design columns. "
-                f"Available: {column_names}"
-            )
-        test_idx = column_names.index(contrast)
-    elif isinstance(contrast, int):
-        test_idx = contrast
-    else:
-        raise NotImplementedError("Custom contrast vectors not yet supported")
+    test_idx = resolve_contrast(contrast, column_names, condition_key=condition_key)
 
     # Filter to non-zero features
     feature_mask = np.array(X.sum(axis=0) > 0).flatten()

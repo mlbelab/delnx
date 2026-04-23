@@ -418,6 +418,86 @@ def nb_fit(
 # =============================================================================
 
 
+def _wald_test(
+    fit: NBFitResult,
+    adata: AnnData,
+    contrast_vec: np.ndarray,
+    multitest_method: str = "fdr_bh",
+    batch_size: int = 512,
+    lfc_threshold: float = 0.0,
+) -> pd.DataFrame:
+    """Wald test for a custom contrast vector.
+
+    Tests H0: c'β = 0 for each gene using the Wald statistic
+    (c'β)² / (c' V c) where V = (X'WX)⁻¹ is the coefficient covariance.
+    """
+    n_genes = fit.beta.shape[0]
+    n_coef = fit.beta.shape[1]
+    n_samples = fit.design_matrix.shape[0]
+    df_full = n_samples - n_coef
+
+    c = contrast_vec
+    X = fit.design_matrix
+
+    # c'β for all genes: (n_genes,)
+    coefs = fit.beta @ c
+    log2fc = np.clip(coefs / np.log(2), -10.0, 10.0)
+
+    # Use dispersion trend if available, else MLE
+    disp = fit.dispersion_trend if fit.dispersion_trend is not None else fit.overdispersions
+
+    # Compute Wald variance per gene: c' (X'WX)⁻¹ c
+    # W_ii = mu_i / (1 + disp * mu_i) — expected Fisher weights
+    wald_var = np.zeros(n_genes)
+    for start in range(0, n_genes, batch_size):
+        end = min(start + batch_size, n_genes)
+        mu_batch = fit.mu[:, start:end]  # (n_samples, batch)
+        disp_batch = disp[start:end]  # (batch,)
+
+        for j in range(end - start):
+            w = mu_batch[:, j] / (1.0 + disp_batch[j] * mu_batch[:, j])
+            XtWX = X.T @ (X * w[:, None])
+            try:
+                V = np.linalg.solve(XtWX, np.eye(n_coef))
+                wald_var[start + j] = c @ V @ c
+            except np.linalg.LinAlgError:
+                wald_var[start + j] = np.nan
+
+    # F-statistic
+    f_stats = coefs**2 / np.maximum(wald_var, 1e-300)
+
+    if fit.ql_dispersions is not None:
+        f_stats = f_stats / np.maximum(fit.ql_dispersions, 1e-10)
+        df_denom = df_full + fit.df0_prior
+        from scipy import stats
+        pvals = stats.f.sf(f_stats, 1, df_denom)
+    else:
+        from scipy import stats
+        pvals = stats.chi2.sf(f_stats, df=1)
+
+    # Multiple testing correction
+    valid_pvals = np.isfinite(pvals)
+    padj = np.ones_like(pvals)
+    if valid_pvals.sum() > 0:
+        padj[valid_pvals] = sm.stats.multipletests(
+            pvals[valid_pvals], method=multitest_method
+        )[1]
+
+    results = pd.DataFrame({
+        "feature": fit.feature_names,
+        "log2fc": log2fc,
+        "coef": coefs,
+        "stat": f_stats,
+        "pval": pvals,
+        "padj": padj,
+    })
+
+    if lfc_threshold > 0:
+        results = results[np.abs(results["log2fc"]) >= lfc_threshold]
+
+    return results.sort_values("pval").reset_index(drop=True)
+
+
 def nb_test(
     adata: AnnData,
     fit: NBFitResult,
@@ -436,11 +516,12 @@ def nb_test(
     fit : NBFitResult
         Fitted model from ``nb_fit()``.
     contrast : str | int | None, default=None
-        Contrast to test. Can be:
+        Coefficient to test. Supports shorthand:
 
-        - str: Design column name to test (e.g., ``"treatmentB"``).
-          Use ``fit.design_column_names`` to see available names.
-        - int: Index of coefficient to test.
+        - Level name: ``"drugA"`` (resolved via ``condition_key``).
+        - Bracket shorthand: ``"treatment[drugA]"`` (for multi-covariate models).
+        - Full patsy name: ``"treatment[T.drugA]"`` (always works).
+        - Integer index or None (last coefficient).
         - None: Test last coefficient.
     reduced_design : np.ndarray | None, default=None
         Reduced design matrix for likelihood ratio test.
@@ -481,19 +562,13 @@ def nb_test(
     n_samples = fit.design_matrix.shape[0]
 
     # Determine which coefficient to test
-    if contrast is None:
-        test_idx = n_coef - 1  # Last coefficient
-    elif isinstance(contrast, int):
-        test_idx = contrast
-    elif isinstance(contrast, str):
-        if contrast not in fit.design_column_names:
-            raise ValueError(
-                f"Contrast '{contrast}' not found in design columns. "
-                f"Available: {fit.design_column_names}"
-            )
-        test_idx = fit.design_column_names.index(contrast)
-    else:
-        raise NotImplementedError("Custom contrast vectors not yet supported")
+    from ._design import parse_contrast_vector, resolve_contrast
+
+    contrast_vec = parse_contrast_vector(contrast, fit.design_column_names, condition_key=fit.condition_key)
+    if contrast_vec is not None:
+        return _wald_test(fit, adata, contrast_vec, multitest_method, batch_size, lfc_threshold)
+
+    test_idx = resolve_contrast(contrast, fit.design_column_names, condition_key=fit.condition_key)
 
     # Get coefficients for tested term
     coefs = fit.beta[:, test_idx]
