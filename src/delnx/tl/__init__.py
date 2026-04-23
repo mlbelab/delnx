@@ -1,3 +1,4 @@
+from ._compare import compare
 from ._de import de
 from ._design import build_design, resolve_contrast
 from ._effects import auroc, log2fc
@@ -10,6 +11,7 @@ __all__ = [
     "de",
     "grouped",
     "build_design",
+    "compare",
     "resolve_contrast",
     "log2fc",
     "auroc",
