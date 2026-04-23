@@ -173,3 +173,86 @@ def resolve_contrast(
         f"Contrast '{contrast}' not found in design columns: {column_names}. "
         f"Use one of the column names directly, or a level value from the condition variable."
     )
+
+
+def parse_contrast_vector(
+    contrast: str | list | np.ndarray | None,
+    column_names: list[str],
+    condition_key: str | None = None,
+) -> np.ndarray | None:
+    """Parse a contrast into a numeric vector, or return None for single-column contrasts.
+
+    Handles:
+
+    - List/array: ``[0, 1, -1]`` — validated and returned directly.
+    - String formula: ``"drugA - drugB"`` — parsed into a numeric vector
+      by resolving each term to a column index.
+    - Single-column strings/int/None: returns ``None`` (caller should use
+      :func:`resolve_contrast` instead).
+
+    Parameters
+    ----------
+    contrast
+        Contrast specification.
+    column_names : list[str]
+        Design matrix column names.
+    condition_key : str | None
+        Condition key for resolving bare level names.
+
+    Returns
+    -------
+    np.ndarray | None
+        Numeric contrast vector of length ``len(column_names)``, or None
+        if the contrast is a single-column specification.
+    """
+    n_coef = len(column_names)
+
+    # List or array → validate and return
+    if isinstance(contrast, (list, np.ndarray)):
+        vec = np.asarray(contrast, dtype=np.float64)
+        if vec.ndim != 1 or len(vec) != n_coef:
+            raise ValueError(
+                f"Contrast vector length {len(vec)} doesn't match {n_coef} coefficients. "
+                f"Design columns: {column_names}"
+            )
+        return vec
+
+    if not isinstance(contrast, str):
+        return None
+
+    # Check if this is a formula (contains + or - outside brackets)
+    # Simple heuristic: strip all bracket content, check for operators
+    stripped = re.sub(r"\[[^\]]*\]", "", contrast)
+    if "+" not in stripped and "-" not in stripped:
+        return None
+
+    # Parse formula: split on + and - while preserving the operator
+    vec = np.zeros(n_coef, dtype=np.float64)
+    # Tokenize: split into (sign, term) pairs
+    # Prepend '+' if formula doesn't start with '-'
+    formula = contrast.strip()
+    if not formula.startswith("-"):
+        formula = "+" + formula
+
+    tokens = re.findall(r"([+-])\s*([^+-]+)", formula)
+    if not tokens:
+        return None
+
+    for sign_str, term in tokens:
+        term = term.strip()
+        if not term:
+            continue
+        sign = 1.0 if sign_str == "+" else -1.0
+
+        # Check for coefficient: "2*drugA" or "0.5 * drugA"
+        coef_match = re.match(r"^([\d.]+)\s*\*\s*(.+)$", term)
+        if coef_match:
+            coef_val = float(coef_match.group(1))
+            term = coef_match.group(2).strip()
+        else:
+            coef_val = 1.0
+
+        idx = resolve_contrast(term, column_names, condition_key=condition_key)
+        vec[idx] += sign * coef_val
+
+    return vec
