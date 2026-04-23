@@ -15,7 +15,7 @@
 [badge-pypi]: https://img.shields.io/pypi/v/delnx.svg?color=blue
 
 
-# 🌳 delnx
+# 🌸 delnx
 
 **delnx** (`"de-lo-nix"  | /dɪˈlɒnɪks/`) is a python package for differential expression analysis of (single-cell) genomics data. It enables scalable analyses of atlas-level datasets through GPU-accelerated regression models and statistical tests implemented in [JAX](https://docs.jax.dev/en/latest/).
 
