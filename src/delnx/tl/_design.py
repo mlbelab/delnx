@@ -83,3 +83,85 @@ def build_design(
     column_names = list(dm.columns)
 
     return design_matrix, column_names
+
+
+import re
+
+_BRACKET_RE = re.compile(r"^(.+)\[(.+)\]$")
+
+
+def resolve_contrast(
+    contrast: str | int | None,
+    column_names: list[str],
+    condition_key: str | None = None,
+) -> int:
+    """Resolve a contrast specification to a column index.
+
+    Supports several shorthand forms so users don't need to write full
+    patsy treatment-coding names:
+
+    1. Full patsy name: ``"treatment[T.drugA]"`` — exact match.
+    2. Bracket shorthand: ``"treatment[drugA]"`` — resolves to
+       ``"treatment[T.drugA]"``.
+    3. Bare level with ``condition_key``: ``"drugA"`` — resolves to
+       ``"treatment[T.drugA]"`` when ``condition_key="treatment"``.
+    4. Bare level scan: ``"drugA"`` — if exactly one column ends with
+       ``[T.drugA]``, use it.
+
+    Parameters
+    ----------
+    contrast : str | int | None
+        Contrast to resolve. ``None`` uses the last coefficient.
+    column_names : list[str]
+        Design matrix column names (from :func:`build_design`).
+    condition_key : str | None
+        Condition key, used for bare-level resolution.
+
+    Returns
+    -------
+    int
+        Column index into the design matrix.
+    """
+    n_coef = len(column_names)
+    if contrast is None:
+        return n_coef - 1
+    if isinstance(contrast, int):
+        if contrast < 0 or contrast >= n_coef:
+            raise IndexError(f"Contrast index {contrast} out of range for {n_coef} coefficients.")
+        return contrast
+    if not isinstance(contrast, str):
+        raise NotImplementedError("Custom contrast vectors are not yet supported.")
+
+    # 1. Exact match
+    if contrast in column_names:
+        return column_names.index(contrast)
+
+    # 2. Bracket shorthand: "key[level]" → "key[T.level]"
+    m = _BRACKET_RE.match(contrast)
+    if m:
+        candidate = f"{m.group(1)}[T.{m.group(2)}]"
+        if candidate in column_names:
+            return column_names.index(candidate)
+
+    # 3. Bare level + condition_key: "level" → "condition_key[T.level]"
+    if condition_key is not None:
+        candidate = f"{condition_key}[T.{contrast}]"
+        if candidate in column_names:
+            return column_names.index(candidate)
+
+    # 4. Bare level suffix scan: find unique "*[T.level]"
+    suffix = f"[T.{contrast}]"
+    matches = [name for name in column_names if name.endswith(suffix)]
+    if len(matches) == 1:
+        return column_names.index(matches[0])
+    if len(matches) > 1:
+        raise ValueError(
+            f"Contrast '{contrast}' is ambiguous — matches: {matches}. "
+            f"Use bracket syntax to disambiguate, e.g. '{matches[0].split('[')[0]}[{contrast}]'."
+        )
+
+    # 5. Nothing matched
+    raise ValueError(
+        f"Contrast '{contrast}' not found in design columns: {column_names}. "
+        f"Use one of the column names directly, or a level value from the condition variable."
+    )

@@ -436,11 +436,12 @@ def nb_test(
     fit : NBFitResult
         Fitted model from ``nb_fit()``.
     contrast : str | int | None, default=None
-        Contrast to test. Can be:
+        Coefficient to test. Supports shorthand:
 
-        - str: Design column name to test (e.g., ``"treatmentB"``).
-          Use ``fit.design_column_names`` to see available names.
-        - int: Index of coefficient to test.
+        - Level name: ``"drugA"`` (resolved via ``condition_key``).
+        - Bracket shorthand: ``"treatment[drugA]"`` (for multi-covariate models).
+        - Full patsy name: ``"treatment[T.drugA]"`` (always works).
+        - Integer index or None (last coefficient).
         - None: Test last coefficient.
     reduced_design : np.ndarray | None, default=None
         Reduced design matrix for likelihood ratio test.
@@ -481,19 +482,9 @@ def nb_test(
     n_samples = fit.design_matrix.shape[0]
 
     # Determine which coefficient to test
-    if contrast is None:
-        test_idx = n_coef - 1  # Last coefficient
-    elif isinstance(contrast, int):
-        test_idx = contrast
-    elif isinstance(contrast, str):
-        if contrast not in fit.design_column_names:
-            raise ValueError(
-                f"Contrast '{contrast}' not found in design columns. "
-                f"Available: {fit.design_column_names}"
-            )
-        test_idx = fit.design_column_names.index(contrast)
-    else:
-        raise NotImplementedError("Custom contrast vectors not yet supported")
+    from ._design import resolve_contrast
+
+    test_idx = resolve_contrast(contrast, fit.design_column_names, condition_key=fit.condition_key)
 
     # Get coefficients for tested term
     coefs = fit.beta[:, test_idx]
