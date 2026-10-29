@@ -12,62 +12,72 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-jobs:
-  test:
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash -e {0} # -e to fail on error
+permissions:
+  contents: read
 
+jobs:
+  # Get the test environment from hatch as defined in pyproject.toml.
+  # This ensures that the pyproject.toml is the single point of truth for test definitions and the same tests are
+  # run locally and on continuous integration.
+  # Check [[tool.hatch.envs.hatch-test.matrix]] in pyproject.toml and https://hatch.pypa.io/latest/environment/ for
+  # more details.
+  get-environments:
+    runs-on: ubuntu-latest
+    outputs:
+      envs: ${{ steps.get-envs.outputs.envs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Get test environments
+        id: get-envs
+        run: |
+          ENVS_JSON=$(NO_COLOR=1 uvx hatch env show --json | jq -c 'to_entries
+            | map(
+              select(.key | startswith("hatch-test"))
+              | {
+                name: .key,
+                label: (if (.key | contains("pre")) then .key + " (PRE-RELEASE DEPENDENCIES)" else .key end),
+                python: .value.python
+              }
+            )')
+          echo "envs=${ENVS_JSON}" | tee $GITHUB_OUTPUT
+
+  test:
+    needs: get-environments
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            python: "3.11"
-          - os: ubuntu-latest
-            python: "3.12"
-          - os: ubuntu-latest
-            python: "3.13"
-          - os: macos-latest
-            python: "3.12"
-
-    name: ${{ matrix.name }} Python ${{ matrix.python }}
-
-    env:
-      OS: ${{ matrix.os }}
-      PYTHON: ${{ matrix.python }}
-
+        os: [ubuntu-latest, macos-latest]
+        env: ${{ fromJSON(needs.get-environments.outputs.envs) }}
+    name: ${{ matrix.env.label }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - name: Set up Python ${{ matrix.python }}
-        uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: ${{ matrix.python }}
-          cache: "pip"
-          cache-dependency-path: "**/pyproject.toml"
-
-      - name: Install test dependencies
-        run: |
-          python -m pip install --upgrade pip wheel
-      - name: Install dependencies
-        run: |
-          pip install tox
-          pip install ${{ matrix.pip-flags }} ".[optional-dependencies.dev,optional-dependencies.test,optional-dependencies.docs]"
-          pip install wandb omegaconf
-      - name: Test
-        run: |
-          tox -e py-${{ matrix.python }}
+          filter: blob:none
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: ${{ matrix.env.python }}
+          cache-dependency-glob: pyproject.toml
+      - name: Create hatch environment
+        run: uvx hatch env create ${{ matrix.env.name }}
+      - name: Run tests using hatch
         env:
-          PYTEST_ADDOPTS: -vv -n 2
-
-      - name: Run tests and collect coverage
+          MPLBACKEND: agg
+        run: uvx hatch run ${{ matrix.env.name }}:run-cov -v --color=yes -n auto
+      - name: Generate coverage report
         run: |
-          pip install pytest coverage
-          coverage run -m pytest
-          coverage xml
-
-      - name: Upload coverage reports to Codecov
+          test -f .coverage || uvx hatch run ${{ matrix.env.name }}:cov-combine
+          uvx hatch run ${{ matrix.env.name }}:coverage xml
+      - name: Upload coverage
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
